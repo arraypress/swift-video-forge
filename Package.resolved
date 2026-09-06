@@ -1,0 +1,15 @@
+{
+  "originHash" : "e905ed0374a12fb90daca1c291b862ad4715c57e52a6b6cb658e711ad161dcea",
+  "pins" : [
+    {
+      "identity" : "swift-image-forge",
+      "kind" : "remoteSourceControl",
+      "location" : "https://github.com/arraypress/swift-image-forge.git",
+      "state" : {
+        "revision" : "02da97eaf3b2099a52659a52f4d6a672e6a68cd7",
+        "version" : "0.1.0"
+      }
+    }
+  ],
+  "version" : 3
+}
