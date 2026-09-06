@@ -1,13 +1,22 @@
 {
-  "originHash" : "e905ed0374a12fb90daca1c291b862ad4715c57e52a6b6cb658e711ad161dcea",
+  "originHash" : "8d7b55f083a341d01bf5db396b38a70a069d134f4debea7d644c1ca1ee619b2b",
   "pins" : [
     {
       "identity" : "swift-image-forge",
       "kind" : "remoteSourceControl",
       "location" : "https://github.com/arraypress/swift-image-forge.git",
       "state" : {
-        "revision" : "02da97eaf3b2099a52659a52f4d6a672e6a68cd7",
-        "version" : "0.1.0"
+        "revision" : "49a4ab7bdefed4a0439057ebbf3c114cce7e614c",
+        "version" : "0.2.0"
+      }
+    },
+    {
+      "identity" : "swift-video-grade",
+      "kind" : "remoteSourceControl",
+      "location" : "https://github.com/arraypress/swift-video-grade.git",
+      "state" : {
+        "revision" : "94c5937449d8fa26033cc232569e8eb9a1c4ade5",
+        "version" : "0.1.1"
       }
     }
   ],

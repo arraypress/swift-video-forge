@@ -125,6 +125,35 @@ public enum VideoForge {
             operations: [], seconds: -started.timeIntervalSinceNow)
     }
 
+    /// Plays a movie backwards.
+    ///
+    /// Reversing cannot stream — the last frame is needed first — so the
+    /// clip is divided into chunks that fit a memory budget, each chunk's
+    /// frames written backwards, and the chunks joined in reverse order.
+    ///
+    /// - Parameters:
+    ///   - source: The movie to reverse.
+    ///   - destination: Where to write.
+    ///   - keepsAudio: Reverse the sound too. A reversed picture with
+    ///     forward sound is worse than a silent one.
+    ///   - budget: The most memory to hold in frames at once.
+    ///   - overwrites: Whether an existing file may be replaced.
+    /// - Returns: What happened.
+    /// - Throws: Any ``VideoForgeError``.
+    @discardableResult
+    public static func reverse(_ source: URL, to destination: URL,
+                               keepsAudio: Bool = true,
+                               budget: Int = Frames.defaultMemoryBudget,
+                               overwrites: Bool = false) async throws -> VideoProcessResult {
+        let started = Date()
+        let before = try await describe(source)
+        let after = try await Reverser.reverse(source, to: destination, keepsAudio: keepsAudio,
+                                               budget: budget, overwrites: overwrites)
+        return VideoProcessResult(source: source, destination: destination, before: before,
+                                  after: after, passedThrough: false, operations: [.reverse],
+                                  seconds: -started.timeIntervalSinceNow)
+    }
+
     // MARK: - Audio
 
     /// Writes a movie's sound out on its own.

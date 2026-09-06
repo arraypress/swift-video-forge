@@ -1,19 +1,20 @@
-// swift-tools-version: 6.1
+// swift-tools-version: 6.2
 import PackageDescription
 
 let package = Package(
     name: "swift-video-forge",
     // AVFoundation, CoreImage and ImageIO only — headless, no UI framework.
-    // macOS 15 matches swift-image-forge, which this leans on for the still
-    // side: a GIF is frames, and frames are that library's job.
+    // macOS 26 matches swift-image-forge, which this leans on for the still
+    // side: a GIF is frames, and frames are that library's job. That floor
+    // comes from the grading engine underneath it.
     platforms: [
-        .macOS(.v15), .iOS(.v18), .tvOS(.v18), .visionOS(.v2)
+        .macOS(.v26), .iOS(.v26)
     ],
     products: [
         .library(name: "VideoForge", targets: ["VideoForge"]),
     ],
     dependencies: [
-        .package(url: "https://github.com/arraypress/swift-image-forge.git", from: "0.1.0"),
+        .package(url: "https://github.com/arraypress/swift-image-forge.git", from: "0.2.0"),
     ],
     targets: [
         .target(
