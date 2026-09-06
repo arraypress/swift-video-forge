@@ -394,6 +394,17 @@ final class VideoForgeTests: XCTestCase {
         XCTAssertEqual(result.after.duration, 1, accuracy: 0.05)
     }
 
+    func testAnOutputFolderIsCreatedRatherThanRefused() async throws {
+        // AVAssetExportSession does not create the folder and reports a
+        // missing parent as "Cannot create file", which reads like a
+        // permissions problem. `img` has always created it; the two tools
+        // disagreeing about whether `--out ./new` works is worse than either.
+        let fresh = out("does/not/exist/yet/trimmed.mov")
+        let result = try await VideoForge.process(clip, to: fresh, options: .trim(.until(1)))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: fresh.path))
+        XCTAssertEqual(result.after.duration, 1, accuracy: 0.05)
+    }
+
     func testTheResultReportsTheRoadItTook() async throws {
         let trimmed = try await VideoForge.process(clip, to: out("a.mov"), options: .trim(.until(1)))
         XCTAssertTrue(trimmed.passedThrough, "time-only work leaves the frames alone")

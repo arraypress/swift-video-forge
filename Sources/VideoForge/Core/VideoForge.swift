@@ -240,13 +240,22 @@ public enum VideoForge {
 
     // MARK: - Guards
 
-    /// Refuses to replace a file unless asked.
+    /// Makes room for a result: creates the folder it goes in, and refuses
+    /// to replace a file unless asked.
+    ///
+    /// The folder matters. `AVAssetExportSession` does not create one, and
+    /// reports a missing parent as "Cannot create file" — which reads like a
+    /// permissions problem rather than a directory that is simply not there.
+    /// `img` has always created it, and two sibling tools disagreeing about
+    /// whether `--out ./new` works is worse than either behaviour.
     ///
     /// - Parameters:
     ///   - url: Where the result would go.
     ///   - overwrites: Whether replacing is allowed.
     /// - Throws: ``VideoForgeError/destinationExists(_:)``.
     static func check(_ url: URL, overwrites: Bool) throws {
+        try? FileManager.default.createDirectory(at: url.deletingLastPathComponent(),
+                                                 withIntermediateDirectories: true)
         guard FileManager.default.fileExists(atPath: url.path) else { return }
         guard overwrites else { throw VideoForgeError.destinationExists(url) }
         try? FileManager.default.removeItem(at: url)
