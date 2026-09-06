@@ -15,7 +15,7 @@ import Foundation
 ///     export: .container(.mp4)
 /// )
 /// ```
-public struct VideoProcessOptions: Sendable, Codable, Equatable, Hashable {
+public struct VideoProcessOptions: Sendable, Codable, Equatable {
     /// What to do, in order.
     public var operations: [VideoOperation]
     /// How to write the result.

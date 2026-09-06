@@ -19,9 +19,10 @@
 
 import CoreGraphics
 import Foundation
+import VideoGrade
 
 /// One step of a video pipeline.
-public enum VideoOperation: Sendable, Codable, Equatable, Hashable {
+public enum VideoOperation: Sendable, Codable, Equatable {
     /// Keep a stretch of the timeline.
     case trim(TrimSpec)
     /// Play faster or slower. 2 is twice as fast, 0.5 is half.
@@ -40,6 +41,16 @@ public enum VideoOperation: Sendable, Codable, Equatable, Hashable {
     case flip(VideoFlip)
     /// Drop a track entirely — the usual reason being to mute a clip.
     case remove(TrackKind)
+    /// Apply colour and tone: exposure, contrast, curves, a LUT, a film
+    /// look — the whole of
+    /// [VideoGrade](https://github.com/arraypress/swift-video-grade), which
+    /// this library calls rather than reimplements.
+    ///
+    /// The same `VideoGrade` value that `img grade` applies to a still, so a
+    /// shoot's stills and its footage match by construction. Unlike a still,
+    /// the animated parts of a look — grain, light leaks, film damage — are
+    /// given the frame's own time, so they move rather than sitting still.
+    case grade(VideoGrade)
 
     /// Whether this step can be done by rearranging time alone, leaving
     /// every frame exactly as it was.
@@ -51,7 +62,7 @@ public enum VideoOperation: Sendable, Codable, Equatable, Hashable {
     public var isTimeOnly: Bool {
         switch self {
         case .trim, .speed, .remove: return true
-        case .reverse, .resize, .crop, .aspect, .rotate, .flip: return false
+        case .reverse, .resize, .crop, .aspect, .rotate, .flip, .grade: return false
         }
     }
 
@@ -60,7 +71,7 @@ public enum VideoOperation: Sendable, Codable, Equatable, Hashable {
     public var changesGeometry: Bool {
         switch self {
         case .resize, .crop, .aspect, .rotate: return true
-        case .trim, .speed, .reverse, .flip, .remove: return false
+        case .trim, .speed, .reverse, .flip, .remove, .grade: return false
         }
     }
 
@@ -76,6 +87,8 @@ public enum VideoOperation: Sendable, Codable, Equatable, Hashable {
         case .rotate(let turn): return "rotate \(turn.rawValue)°"
         case .flip(let axis): return "flip \(axis.rawValue)"
         case .remove(let kind): return "remove \(kind.rawValue)"
+        case .grade(let grade):
+            return grade.lutURL.map { "grade with \($0.lastPathComponent)" } ?? "grade"
         }
     }
 }

@@ -21,6 +21,7 @@
 
 import AVFoundation
 import CoreImage
+import VideoGrade
 import CoreGraphics
 import Foundation
 
@@ -45,7 +46,11 @@ public enum Renderer {
 
         let composition = try await AVMutableVideoComposition.videoComposition(
             with: asset) { request in
-                let rendered = plan.apply(to: request.sourceImage)
+                // The frame's own time, so the animated parts of a grade —
+                // grain, light leaks, film damage — move instead of being
+                // frozen on one pattern for the whole clip.
+                let rendered = plan.apply(to: request.sourceImage,
+                                          at: request.compositionTime.seconds)
                 request.finish(with: rendered, context: nil)
             }
         composition.renderSize = target
@@ -65,6 +70,11 @@ public enum Renderer {
         let rotation: VideoRotation?
         /// The mirror applied last.
         let flip: VideoFlip?
+        /// The colour and tone pass, built ONCE. A 4K clip at 60fps calls
+        /// the handler fourteen thousand times a minute; rebuilding the
+        /// filter chain — which bakes a 32³ colour cube — in each of those
+        /// would dominate the run.
+        let grade: GradeFilter?
         /// The size the composition renders at.
         let outputSize: CGSize
 
@@ -78,6 +88,7 @@ public enum Renderer {
             var turn: VideoRotation?
             var mirror: VideoFlip?
             var scaleTo = size
+            var look: GradeFilter?
 
             for operation in operations where !operation.isTimeOnly {
                 switch operation {
@@ -134,6 +145,17 @@ public enum Renderer {
                 case .flip(let axis):
                     mirror = axis
 
+                case .grade(let wanted):
+                    guard !wanted.isNeutral else { break }
+                    do {
+                        look = try GradeFilter(grade: wanted)
+                    } catch {
+                        // A named LUT that will not load is a mistake worth
+                        // stopping for, not one to apply half of.
+                        throw VideoForgeError.exportFailed(
+                            reason: "the grade could not be built: \(error.localizedDescription)")
+                    }
+
                 default:
                     break
                 }
@@ -143,14 +165,18 @@ public enum Renderer {
             scale = scaleTo
             rotation = turn
             flip = mirror
+            grade = look
             outputSize = VideoSize.even(size)
         }
 
         /// Applies the plan to one frame.
         ///
-        /// - Parameter image: The frame, already oriented.
+        /// - Parameters:
+        ///   - image: The frame, already oriented.
+        ///   - time: Where the frame sits in the composition, in seconds.
+        ///     The grade's animated effects read it.
         /// - Returns: The frame to write.
-        func apply(to image: CIImage) -> CIImage {
+        func apply(to image: CIImage, at time: TimeInterval = 0) -> CIImage {
             var output = image
 
             // A fill-resize scales first and crops the overflow; every other
@@ -181,6 +207,12 @@ public enum Renderer {
                 output = output.transformed(by: transform)
                 output = output.transformed(by: CGAffineTransform(
                     translationX: -output.extent.minX, y: -output.extent.minY))
+            }
+            // Colour last, over the final geometry: grading before a crop
+            // would compute a vignette and a grain field for pixels that are
+            // about to be thrown away, and centre them on the wrong frame.
+            if let grade {
+                output = grade.apply(output, time: time)
             }
             return output
         }

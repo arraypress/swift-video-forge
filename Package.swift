@@ -15,11 +15,17 @@ let package = Package(
     ],
     dependencies: [
         .package(url: "https://github.com/arraypress/swift-image-forge.git", from: "0.2.0"),
+        // The colour and tone engine, shared with `img` so a look applied to a
+        // still and to a clip is the same look.
+        .package(url: "https://github.com/arraypress/swift-video-grade.git", from: "0.1.1"),
     ],
     targets: [
         .target(
             name: "VideoForge",
-            dependencies: [.product(name: "ImageForge", package: "swift-image-forge")]
+            dependencies: [
+                .product(name: "ImageForge", package: "swift-image-forge"),
+                .product(name: "VideoGrade", package: "swift-video-grade"),
+            ]
         ),
         .testTarget(name: "VideoForgeTests", dependencies: ["VideoForge"]),
     ]

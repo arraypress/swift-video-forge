@@ -12,7 +12,7 @@
 import Foundation
 
 /// The outcome of one video job.
-public struct VideoProcessResult: Sendable, Codable, Equatable, Hashable {
+public struct VideoProcessResult: Sendable, Codable, Equatable {
     /// Where the movie came from.
     public let source: URL
     /// Where it was written.
