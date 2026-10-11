@@ -98,6 +98,21 @@ extension VideoForge {
         }
     }
 
+    // MARK: - Languages
+
+    /// Whether a subtitle track can declare this language — `en`, `eng`,
+    /// `pt-BR`, `zh-Hant` — so a caller can refuse a bad one before reading
+    /// a file.
+    public static func isSubtitleLanguage(_ code: String) -> Bool {
+        SubtitleLanguage.codes(for: code) != nil
+    }
+
+    /// The language tag in a subtitle file's name — `film.ja.srt` gives
+    /// `ja`, `film.pt-BR.vtt` gives `pt-BR` — or nil when it has none.
+    public static func subtitleLanguage(inFileName url: URL) -> String? {
+        SubtitleLanguage.fromFileName(url)
+    }
+
     // MARK: - Reading
 
     /// Every subtitle and caption track in a movie, with its cues.

@@ -120,6 +120,10 @@ final class SubtitleTests: XCTestCase {
         XCTAssertEqual(SubtitleLanguage.readable(code: "jpn", tag: nil), "ja")
         XCTAssertEqual(SubtitleLanguage.readable(code: "por", tag: "pt-BR"), "pt-BR")
         XCTAssertNil(SubtitleLanguage.readable(code: "und", tag: nil))
+        // The public face of the same rules.
+        XCTAssertTrue(VideoForge.isSubtitleLanguage("pt-BR"))
+        XCTAssertFalse(VideoForge.isSubtitleLanguage("klingon"))
+        XCTAssertEqual(VideoForge.subtitleLanguage(inFileName: URL(fileURLWithPath: "/m/film.de.srt")), "de")
     }
 
     // MARK: - End to end
