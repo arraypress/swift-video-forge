@@ -42,6 +42,11 @@ public enum VideoForgeError: Error, LocalizedError, Sendable, Equatable {
     case containerCannotHold(VideoContainer, TrackKind)
     /// Joining clips that do not agree on something that matters.
     case incompatibleClips(reason: String)
+    /// Subtitles that cannot be written as asked — no cue inside the video,
+    /// an unknown language, two default tracks.
+    case invalidSubtitles(String)
+    /// The movie holds no subtitle or caption track.
+    case noSubtitleTrack(URL)
 
     /// A lowercase phrase that reads inside a sentence, for a CLI or a log.
     public var errorDescription: String? {
@@ -73,6 +78,10 @@ public enum VideoForgeError: Error, LocalizedError, Sendable, Equatable {
             return "\(container.rawValue) cannot hold a \(kind.rawValue) track"
         case .incompatibleClips(let reason):
             return "these clips cannot be joined: \(reason)"
+        case .invalidSubtitles(let reason):
+            return reason
+        case .noSubtitleTrack(let url):
+            return "\(url.lastPathComponent) has no subtitle or caption track"
         }
     }
 }

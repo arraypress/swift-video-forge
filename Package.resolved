@@ -1,5 +1,5 @@
 {
-  "originHash" : "8d7b55f083a341d01bf5db396b38a70a069d134f4debea7d644c1ca1ee619b2b",
+  "originHash" : "3711dc0d076caf6490100ab2d57ffbee4bdbbd5cffa71a0999f2b3a0d23a264b",
   "pins" : [
     {
       "identity" : "swift-image-forge",
@@ -8,6 +8,15 @@
       "state" : {
         "revision" : "49a4ab7bdefed4a0439057ebbf3c114cce7e614c",
         "version" : "0.2.0"
+      }
+    },
+    {
+      "identity" : "swift-subtitle-kit",
+      "kind" : "remoteSourceControl",
+      "location" : "https://github.com/arraypress/swift-subtitle-kit.git",
+      "state" : {
+        "revision" : "68a355c9baa3ca36ee55e028dbd4bd3106ecaa18",
+        "version" : "0.1.0"
       }
     },
     {

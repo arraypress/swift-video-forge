@@ -36,6 +36,60 @@ Which one a job takes is the most consequential thing about it, so
 A job that needs both gets both, with the time work first — so the render road
 only ever sees the frames that survived the trim.
 
+A third, narrow road adds tracks: **copy** reads every sample of every track
+and writes it back unchanged beside the new ones. It exists for subtitles,
+because the composition road cannot make a subtitle a player will offer.
+
+## Subtitle tracks
+
+```swift
+import SubtitleKit
+
+let cues = try SubtitleParser.parse(contentsOf: srt)
+try await VideoForge.addSubtitles(
+    [Subtitles(cues: cues, language: "en", isDefault: true),
+     Subtitles(cues: japanese, language: "ja")],
+    to: clip, destination: subtitled)
+
+for track in try await VideoForge.subtitles(in: subtitled) {
+    print(track.language ?? "?", track.cues.count)
+}
+```
+
+Written as **`tx3g`** (ffmpeg's `mov_text`) in `.mp4`, `.m4v` or `.mov`; read
+back from `tx3g`, QuickTime `text`, `wvtt` and CEA-608 closed captions. Two
+earlier attempts at writing subtitles failed, so every route was measured on
+macOS 27 before this one was chosen:
+
+| route | result |
+|---|---|
+| `tx3g` from a hand-built sample entry (2026-09) | file would not reopen (-12848) |
+| AVCaption writer, text media (`tx3g`/`text`, .mov and .mp4) | refused, -12780, every combination |
+| AVCaption writer, `.subtitle` media | uncatchable exception: unsupported media type |
+| AVCaption writer, CEA-608 closed captions | writes — but CJK, Arabic and emoji come back as `█`, line breaks are lost, overlapping cues are cut short |
+| `wvtt` samples | writes and reads back, but loading the subtitle menu fails (-12718) and ffmpeg 9 cannot read it in MP4 |
+| **`tx3g` with AVFoundation's own sample description** | **reopens, lists in the subtitle menu, ffmpeg decodes every cue exactly** |
+
+The description that works is the one AVFoundation itself reports for a track
+ffmpeg wrote, rebuilt from its keys. Then the mux:
+
+- **The composition road loses the menu.** A passthrough export writes every
+  track with alternate group 0, and a subtitle outside an alternate group is
+  never offered — the legible media-selection group came back empty. The copy
+  road puts every subtitle track, old and new, in one writer input group.
+- **macOS 26's async writer receivers deadlocked** on a plain H.264 + AAC
+  copy, two seconds in, every time. Callback feeding on one serial queue does
+  not, and its state sits behind one `Mutex`, so the compiler checks it.
+- **Nothing else is touched.** On a 90 s 1080p clip with B-frames the video
+  and audio packets were MD5-identical to the source, every timestamp
+  identical, 0.6 s warm. Movie metadata and chapter-list associations are
+  carried across.
+
+What a `tx3g` track cannot do is hold two cues at once, so overlapping cues
+are written as what a viewer sees — stacked, in the order they appeared — and
+read back as those pieces. Cues past the video's end are cut at the end. At
+most one track is the default; the rest wait in the menu.
+
 ## Measured
 
 Everything here was measured on macOS 27 before the code was written, and two
@@ -93,7 +147,7 @@ stops lining up. Every size this library produces is even.
 
 ## Requirements
 
-macOS 15+ / iOS 18+ / tvOS 18+ / visionOS 2+, Swift 6.
+macOS 26+ / iOS 26+, Swift 6.2 (Xcode 26).
 
 ## License
 
