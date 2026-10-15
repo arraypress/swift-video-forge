@@ -29,6 +29,9 @@ public struct TrackInfo: Sendable, Codable, Equatable, Hashable {
     /// Bits per component, for a video track. 10 means the source is worth
     /// keeping in HEVC rather than truncating to H.264.
     public let bitDepth: Int?
+    /// Whether a video track carries an alpha channel — HEVC with alpha, or
+    /// ProRes 4444 with one.
+    public let hasAlpha: Bool
     /// Channels, for an audio track.
     public let channels: Int?
     /// Samples per second, for an audio track.
@@ -46,12 +49,14 @@ public struct TrackInfo: Sendable, Codable, Equatable, Hashable {
     ///   - height: Frame height, for video.
     ///   - frameRate: Frames per second, for video.
     ///   - bitDepth: Bits per component, for video.
+    ///   - hasAlpha: Whether a video track carries alpha.
     ///   - channels: Channel count, for audio.
     ///   - sampleRate: Samples per second, for audio.
     ///   - language: The declared language, if any.
     public init(kind: TrackKind, codec: String, duration: Double, bitRate: Double,
                 width: Int? = nil, height: Int? = nil, frameRate: Double? = nil,
-                bitDepth: Int? = nil, channels: Int? = nil, sampleRate: Double? = nil,
+                bitDepth: Int? = nil, hasAlpha: Bool = false,
+                channels: Int? = nil, sampleRate: Double? = nil,
                 language: String? = nil) {
         self.kind = kind
         self.codec = codec
@@ -61,14 +66,26 @@ public struct TrackInfo: Sendable, Codable, Equatable, Hashable {
         self.height = height
         self.frameRate = frameRate
         self.bitDepth = bitDepth
+        self.hasAlpha = hasAlpha
         self.channels = channels
         self.sampleRate = sampleRate
         self.language = language
     }
 
-    /// Whether this track carries more than 8 bits per component, and so
-    /// must not be re-encoded as H.264.
+    /// Whether this track is stored with more than 8 bits per component.
     public var isDeep: Bool { (bitDepth ?? 8) >= 10 }
+
+    /// Whether the depth is the footage's own, so writing it with an 8-bit
+    /// codec would truncate what the camera recorded.
+    ///
+    /// False for ProRes, which declares 12 bits (16 with alpha) whatever it
+    /// was made from — MEASURED on ProRes written by AVFoundation from 8-bit
+    /// H.264 and by ffmpeg — so its depth says nothing about the footage.
+    /// Before 0.5.0 that refused every ProRes clip made from 8-bit footage
+    /// on its way back to H.264.
+    public var forbidsEightBit: Bool {
+        isDeep && CodecPlan.codec(named: codec)?.isIntraFrame != true
+    }
 
     /// The frame size, for a video track.
     public var size: CGSize? {

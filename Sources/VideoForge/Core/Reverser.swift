@@ -76,7 +76,7 @@ public enum Reverser {
         var pieces: [URL] = []
         for (index, range) in chunks.enumerated().reversed() {
             let piece = workspace.appendingPathComponent("chunk-\(index).mov")
-            try await reverseChunk(asset, range: range, track: track, codec: writes,
+            try await reverseChunk(source, range: range, track: track, codec: writes,
                                    deep: info.isDeep, to: piece)
             pieces.append(piece)
         }
@@ -121,15 +121,17 @@ public enum Reverser {
     /// Reads one chunk's frames and writes them backwards.
     ///
     /// - Parameters:
-    ///   - asset: The source.
+    ///   - movie: The source. A URL rather than an asset, so the frames read
+    ///     here belong to this call alone and can be handed to the writer.
     ///   - range: The chunk.
     ///   - track: The source's video track, described.
     ///   - codec: The concrete codec to write.
     ///   - deep: Whether the source is 10-bit, so the frames are read and
     ///     written at 10 bits rather than squeezed through 8-bit BGRA.
     ///   - url: Where the chunk goes.
-    static func reverseChunk(_ asset: AVAsset, range: CMTimeRange, track: TrackInfo,
+    static func reverseChunk(_ movie: URL, range: CMTimeRange, track: TrackInfo,
                              codec: VideoCodec, deep: Bool, to url: URL) async throws {
+        let asset = AVURLAsset(url: movie)
         guard let source = try await asset.loadTracks(withMediaType: .video).first else {
             throw VideoForgeError.noVideoTrack(url)
         }
@@ -156,25 +158,14 @@ public enum Reverser {
         // The frames come out backwards; the timestamps stay in forward order,
         // so the chunk plays for exactly as long as it did.
         let offsets = times.map { CMTimeSubtract($0, range.start) }
-        let colour = try await colourProperties(of: source)
-        try await write(images.reversed(), at: offsets, size: track.size ?? .zero,
-                        codec: codec, deep: deep, bitRate: Int(track.bitRate),
-                        colour: colour, to: url)
-    }
-
-    /// The source's colour tags, as writer settings, so an HLG or PQ clip
-    /// is not written back untagged and played as if it were Rec. 709.
-    static func colourProperties(of track: AVAssetTrack) async throws -> [String: String]? {
-        guard let description = try await track.load(.formatDescriptions).first else { return nil }
-        let tag = { (key: CFString) in
-            CMFormatDescriptionGetExtension(description, extensionKey: key) as? String
-        }
-        guard let primaries = tag(kCMFormatDescriptionExtension_ColorPrimaries),
-              let transfer = tag(kCMFormatDescriptionExtension_TransferFunction),
-              let matrix = tag(kCMFormatDescriptionExtension_YCbCrMatrix) else { return nil }
-        return [AVVideoColorPrimariesKey: primaries,
-                AVVideoTransferFunctionKey: transfer,
-                AVVideoYCbCrMatrixKey: matrix]
+        // The writer is told what the source was — its codec story, its rate,
+        // its colour tags — by the same rules every other writer here uses.
+        let sourceFormat = try await VideoSourceFormat.load(from: source)
+        let settings = WriterSettings.derive(
+            from: sourceFormat, codec: codec,
+            bitRate: track.bitRate > 0 ? Int(track.bitRate) : nil)
+        try await write(images.reversed(), at: offsets, settings: settings,
+                        transform: try await source.load(.preferredTransform), to: url)
     }
 
     /// Writes frames to a file, one writer input, nothing to interleave.
@@ -182,68 +173,39 @@ public enum Reverser {
     /// - Parameters:
     ///   - frames: The pictures, in the order to write them.
     ///   - times: Their presentation times.
-    ///   - size: The frame size.
-    ///   - codec: The concrete codec.
-    ///   - deep: Whether the frames are 10-bit, which asks HEVC for Main 10.
-    ///   - bitRate: The source's rate, honoured by the inter-frame codecs.
-    ///   - colour: Colour tags to carry, if the source had them.
+    ///   - settings: The writer's settings, derived from the source.
+    ///   - transform: The source's display transform. Up to 0.4.0 it was
+    ///     dropped, so a phone clip shot upright came back from `reverse`
+    ///     lying on its side (640×360 from a 360×640 clip).
     ///   - url: Where to write.
-    static func write(_ frames: [CVPixelBuffer], at times: [CMTime], size: CGSize,
-                      codec: VideoCodec, deep: Bool, bitRate: Int,
-                      colour: [String: String]?, to url: URL) async throws {
-        let width = Int(size.width), height = Int(size.height)
+    static func write(_ frames: sending [CVPixelBuffer], at times: [CMTime], settings: WriterSettings,
+                      transform: CGAffineTransform, to url: URL) async throws {
         let writer = try AVAssetWriter(outputURL: url, fileType: .mov)
-        var settings: [String: Any] = [
-            AVVideoCodecKey: codec.codecType ?? .h264,
-            AVVideoWidthKey: width, AVVideoHeightKey: height,
-        ]
-        var compression: [String: Any] = [:]
-        if bitRate > 0, !codec.isIntraFrame { compression[AVVideoAverageBitRateKey] = bitRate }
-        // Under the compression properties, not at the top level, where it
-        // throws an Objective-C exception.
-        if deep, codec == .hevc {
-            compression[AVVideoProfileLevelKey] = kVTProfileLevel_HEVC_Main10_AutoLevel as String
-        }
-        if !compression.isEmpty { settings[AVVideoCompressionPropertiesKey] = compression }
+        var output = settings.videoOutputSettings
         // Settings the writer would reject raise an exception Swift cannot
-        // catch, so the colour tags are offered only when they apply.
-        if let colour {
-            var tagged = settings
-            tagged[AVVideoColorPropertiesKey] = colour
-            if writer.canApply(outputSettings: tagged, forMediaType: .video) { settings = tagged }
+        // catch, so the colour tags are kept only when the writer takes them.
+        if !writer.canApply(outputSettings: output, forMediaType: .video) {
+            output[AVVideoColorPropertiesKey] = nil
         }
-        guard writer.canApply(outputSettings: settings, forMediaType: .video) else {
-            throw VideoForgeError.writeFailed(url, reason: "the writer will not take \(codec.rawValue) at \(width)×\(height)")
+        guard writer.canApply(outputSettings: output, forMediaType: .video) else {
+            throw VideoForgeError.writeFailed(
+                url, reason: "the writer will not take \(settings.codec.rawValue) at \(settings.width)×\(settings.height)")
         }
-        let input = AVAssetWriterInput(mediaType: .video, outputSettings: settings)
+        let input = AVAssetWriterInput(mediaType: .video, outputSettings: output)
         input.expectsMediaDataInRealTime = false
+        input.transform = transform
         let adaptor = AVAssetWriterInputPixelBufferAdaptor(assetWriterInput: input,
                                                            sourcePixelBufferAttributes: nil)
         writer.add(input)
-        guard writer.startWriting() else {
-            throw VideoForgeError.writeFailed(url, reason: writer.error?.localizedDescription ?? "refused")
-        }
-        writer.startSession(atSourceTime: .zero)
 
-        let ordered = Array(frames)
-        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
-            var index = 0
-            input.requestMediaDataWhenReady(on: DispatchQueue(label: "video-forge.reverse")) {
-                while input.isReadyForMoreMediaData {
-                    guard index < ordered.count else {
-                        input.markAsFinished()
-                        continuation.resume()
-                        return
-                    }
-                    adaptor.append(ordered[index], withPresentationTime: times[index])
-                    index += 1
-                }
-            }
+        var index = 0
+        let feed = WriterFeed(input: input) {
+            guard index < frames.count else { return false }
+            adaptor.append(frames[index], withPresentationTime: times[index])
+            index += 1
+            return true
         }
-        await writer.finishWriting()
-        if writer.status == .failed {
-            throw VideoForgeError.writeFailed(url, reason: writer.error?.localizedDescription ?? "failed")
-        }
+        try await WriterPump.run(WriterJob(reader: nil, writer: writer, feeds: [feed]))
     }
 
     /// Reverses the sound into a file of its own.
@@ -310,7 +272,12 @@ public enum Reverser {
                 buffer.floatChannelData?[channel][frame] = reversed[frame * channels + channel]
             }
         }
-        let file = try AVAudioFile(forWriting: url, settings: format.settings)
+        // Interleaved on disk: a CAF told non-interleaved logs a complaint
+        // to stderr and ignores it.
+        var fileSettings = format.settings
+        fileSettings[AVLinearPCMIsNonInterleaved] = false
+        let file = try AVAudioFile(forWriting: url, settings: fileSettings,
+                                   commonFormat: .pcmFormatFloat32, interleaved: false)
         try file.write(from: buffer)
         return url
     }

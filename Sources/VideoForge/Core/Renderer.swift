@@ -58,13 +58,21 @@ public enum Renderer {
         // frames 27–39 luma codes brighter (of 1023), tagged SMPTE 170M with
         // no transfer function; H.264 and HEVC tag Rec. 709 and kept every
         // value. Untagged video is Rec. 709 by convention, so it is said
-        // outright. A tagged source keeps its own tags, which the
-        // composition has already picked up.
+        // outright.
+        //
+        // A tagged source keeps its own tags — read here from the track,
+        // because a composition built over an AVComposition (every job, since
+        // the time steps come first) picks up NONE. Up to 0.4.0 that wrote a
+        // BT.2020 HLG clip's redraw tagged Rec. 709: HDR footage relabelled
+        // as SDR.
         if composition.colorPrimaries == nil, composition.colorTransferFunction == nil,
            composition.colorYCbCrMatrix == nil {
-            composition.colorPrimaries = AVVideoColorPrimaries_ITU_R_709_2
-            composition.colorTransferFunction = AVVideoTransferFunction_ITU_R_709_2
-            composition.colorYCbCrMatrix = AVVideoYCbCrMatrix_ITU_R_709_2
+            let description = try await asset.loadTracks(withMediaType: .video).first?
+                .load(.formatDescriptions).first
+            let own = description.flatMap(FormatDescriptions.colour(of:))
+            composition.colorPrimaries = own?.primaries ?? AVVideoColorPrimaries_ITU_R_709_2
+            composition.colorTransferFunction = own?.transfer ?? AVVideoTransferFunction_ITU_R_709_2
+            composition.colorYCbCrMatrix = own?.matrix ?? AVVideoYCbCrMatrix_ITU_R_709_2
         }
         return (composition, target)
     }

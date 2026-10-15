@@ -33,9 +33,12 @@ enum TestClips {
     ///   - width: Frame width. Even, as encoders require.
     ///   - height: Frame height.
     ///   - hue: The bar's colour, so two clips can be told apart when joined.
+    ///   - noise: Fill the lower half with fresh noise every frame, so an
+    ///     encoder spends whatever it is allowed — a bitrate test needs
+    ///     pictures that cost something.
     static func writeVideo(to url: URL, seconds: Double = 2, fps: Int = 30,
                            width: Int = 320, height: Int = 240,
-                           hue: CGFloat = 0.05) async throws {
+                           hue: CGFloat = 0.05, noise: Bool = false) async throws {
         try? FileManager.default.removeItem(at: url)
         let writer = try AVAssetWriter(outputURL: url, fileType: .mov)
         let input = AVAssetWriterInput(mediaType: .video, outputSettings: [
@@ -83,6 +86,17 @@ enum TestClips {
                         context.fill(CGRect(x: x, y: CGFloat(height) / 3,
                                             width: 40, height: CGFloat(height) / 3))
                     }
+                    if noise, let base = CVPixelBufferGetBaseAddress(pixels) {
+                        let stride = CVPixelBufferGetBytesPerRow(pixels)
+                        var state = UInt32(truncatingIfNeeded: frame &* 2_654_435_761 | 1)
+                        for y in (height / 2)..<height {
+                            let row = (base + y * stride).assumingMemoryBound(to: UInt8.self)
+                            for x in 0..<(width * 4) where x % 4 != 3 {
+                                state ^= state << 13; state ^= state >> 17; state ^= state << 5
+                                row[x] = UInt8(truncatingIfNeeded: state)
+                            }
+                        }
+                    }
                     CVPixelBufferUnlockBaseAddress(pixels, [])
                     adaptor.append(pixels, withPresentationTime:
                         CMTime(value: CMTimeValue(frame), timescale: CMTimeScale(fps)))
@@ -115,13 +129,13 @@ enum TestClips {
     @discardableResult
     static func writeMovie(to url: URL, seconds: Double = 2, fps: Int = 30,
                            width: Int = 320, height: Int = 240,
-                           hue: CGFloat = 0.05, hz: Double = 440) async throws -> URL {
+                           hue: CGFloat = 0.05, hz: Double = 440, noise: Bool = false) async throws -> URL {
         let folder = url.deletingLastPathComponent()
         let stem = url.deletingPathExtension().lastPathComponent
         let silent = folder.appendingPathComponent("\(stem)-video.mov")
         let tone = folder.appendingPathComponent("\(stem)-audio.caf")
         try await writeVideo(to: silent, seconds: seconds, fps: fps,
-                             width: width, height: height, hue: hue)
+                             width: width, height: height, hue: hue, noise: noise)
         try writeAudio(to: tone, seconds: seconds, hz: hz)
 
         let composition = AVMutableComposition()
@@ -156,18 +170,28 @@ enum TestClips {
     ///   - fps: Frames per second.
     ///   - width: Frame width. Even.
     ///   - height: Frame height. Even.
+    ///   - hlg: Tag it BT.2020 HLG, like an iPhone HDR clip, rather than
+    ///     leaving it untagged.
     static func writeDeepVideo(to url: URL, seconds: Double = 1, fps: Int = 30,
-                               width: Int = 320, height: Int = 240) async throws {
+                               width: Int = 320, height: Int = 240, hlg: Bool = false) async throws {
         try? FileManager.default.removeItem(at: url)
         let writer = try AVAssetWriter(outputURL: url, fileType: .mov)
-        let input = AVAssetWriterInput(mediaType: .video, outputSettings: [
+        var settings: [String: Any] = [
             AVVideoCodecKey: AVVideoCodecType.hevc,
             AVVideoWidthKey: width, AVVideoHeightKey: height,
             AVVideoCompressionPropertiesKey: [
                 AVVideoProfileLevelKey: kVTProfileLevel_HEVC_Main10_AutoLevel as String,
                 AVVideoQualityKey: 1.0,
             ],
-        ])
+        ]
+        if hlg {
+            settings[AVVideoColorPropertiesKey] = [
+                AVVideoColorPrimariesKey: AVVideoColorPrimaries_ITU_R_2020,
+                AVVideoTransferFunctionKey: AVVideoTransferFunction_ITU_R_2100_HLG,
+                AVVideoYCbCrMatrixKey: AVVideoYCbCrMatrix_ITU_R_2020,
+            ]
+        }
+        let input = AVAssetWriterInput(mediaType: .video, outputSettings: settings)
         input.expectsMediaDataInRealTime = false
         let adaptor = AVAssetWriterInputPixelBufferAdaptor(
             assetWriterInput: input,
@@ -221,6 +245,105 @@ enum TestClips {
             }
         }
         await writer.finishWriting()
+    }
+
+    /// An HEVC-with-alpha clip whose left half is opaque and right half is
+    /// alpha 80 of 255 — written by AVFoundation, as Final Cut or Motion
+    /// would write one.
+    static func writeAlphaVideo(to url: URL, seconds: Double = 1, fps: Int = 30,
+                                width: Int = 320, height: Int = 240) async throws {
+        try? FileManager.default.removeItem(at: url)
+        let writer = try AVAssetWriter(outputURL: url, fileType: .mov)
+        let input = AVAssetWriterInput(mediaType: .video, outputSettings: [
+            AVVideoCodecKey: AVVideoCodecType.hevcWithAlpha,
+            AVVideoWidthKey: width, AVVideoHeightKey: height,
+        ])
+        input.expectsMediaDataInRealTime = false
+        let adaptor = AVAssetWriterInputPixelBufferAdaptor(
+            assetWriterInput: input,
+            sourcePixelBufferAttributes: [
+                kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA,
+                kCVPixelBufferWidthKey as String: width,
+                kCVPixelBufferHeightKey as String: height,
+            ])
+        writer.add(input)
+        writer.startWriting()
+        writer.startSession(atSourceTime: .zero)
+        let total = Int(Double(fps) * seconds)
+        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+            var frame = 0
+            input.requestMediaDataWhenReady(on: DispatchQueue(label: "test.write.alpha")) {
+                while input.isReadyForMoreMediaData {
+                    guard frame < total else {
+                        input.markAsFinished()
+                        continuation.resume()
+                        return
+                    }
+                    guard let pool = adaptor.pixelBufferPool else { continue }
+                    var buffer: CVPixelBuffer?
+                    CVPixelBufferPoolCreatePixelBuffer(nil, pool, &buffer)
+                    guard let pixels = buffer else { continue }
+                    CVPixelBufferLockBaseAddress(pixels, [])
+                    if let base = CVPixelBufferGetBaseAddress(pixels) {
+                        let stride = CVPixelBufferGetBytesPerRow(pixels)
+                        for y in 0..<height {
+                            let row = (base + y * stride).assumingMemoryBound(to: UInt8.self)
+                            for x in 0..<width {
+                                let alpha: UInt8 = x < width / 2 ? 255 : 80
+                                // Premultiplied BGRA: a mid grey at this alpha.
+                                let grey = UInt8(Int(alpha) / 2)
+                                row[x * 4] = grey; row[x * 4 + 1] = grey; row[x * 4 + 2] = grey
+                                row[x * 4 + 3] = alpha
+                            }
+                        }
+                    }
+                    CVPixelBufferUnlockBaseAddress(pixels, [])
+                    adaptor.append(pixels, withPresentationTime:
+                        CMTime(value: CMTimeValue(frame), timescale: CMTimeScale(fps)))
+                    frame += 1
+                }
+            }
+        }
+        await writer.finishWriting()
+    }
+
+    /// The alpha of a clip's first frame at a quarter and three quarters of
+    /// the way across its middle row, decoded as BGRA.
+    static func alphaSamples(of url: URL) async throws -> (left: Int, right: Int) {
+        let asset = AVURLAsset(url: url)
+        guard let track = try await asset.loadTracks(withMediaType: .video).first else { return (-1, -1) }
+        let reader = try AVAssetReader(asset: asset)
+        let output = AVAssetReaderTrackOutput(track: track, outputSettings: [
+            kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA,
+        ])
+        reader.add(output)
+        reader.startReading()
+        defer { reader.cancelReading() }
+        guard let sample = output.copyNextSampleBuffer(),
+              let pixels = CMSampleBufferGetImageBuffer(sample) else { return (-1, -1) }
+        CVPixelBufferLockBaseAddress(pixels, .readOnly)
+        defer { CVPixelBufferUnlockBaseAddress(pixels, .readOnly) }
+        guard let base = CVPixelBufferGetBaseAddress(pixels) else { return (-1, -1) }
+        let width = CVPixelBufferGetWidth(pixels), height = CVPixelBufferGetHeight(pixels)
+        let row = (base + (height / 2) * CVPixelBufferGetBytesPerRow(pixels)).assumingMemoryBound(to: UInt8.self)
+        return (Int(row[(width / 4) * 4 + 3]), Int(row[(3 * width / 4) * 4 + 3]))
+    }
+
+    /// Every video frame's presentation time, in order.
+    static func frameTimes(of url: URL) async throws -> [Double] {
+        let asset = AVURLAsset(url: url)
+        guard let track = try await asset.loadTracks(withMediaType: .video).first else { return [] }
+        let reader = try AVAssetReader(asset: asset)
+        let output = AVAssetReaderTrackOutput(track: track, outputSettings: nil)
+        reader.add(output)
+        reader.startReading()
+        var times: [Double] = []
+        while let sample = output.copyNextSampleBuffer() {
+            if CMSampleBufferGetNumSamples(sample) > 0 {
+                times.append(CMSampleBufferGetPresentationTimeStamp(sample).seconds)
+            }
+        }
+        return times.sorted()
     }
 
     /// The 10-bit luma along the middle row of a clip's first frame, decoded

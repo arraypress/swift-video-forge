@@ -90,21 +90,17 @@ public enum Probe {
 
         var codec = "----"
         var depth: Int?
+        var alpha = false
         var channels: Int?
         var sampleRate: Double?
 
         if let description {
-            codec = fourCharacterCode(CMFormatDescriptionGetMediaSubType(description))
+            codec = FormatDescriptions.codec(of: description)
             if kind == .video {
-                let extensions = CMFormatDescriptionGetExtensions(description) as? [String: Any]
-                // MEASURED, and not what it looks like. `Depth` is
-                // QuickTime's PIXEL depth and reads 24 for 8-bit H.264 *and*
-                // for 10-bit HEVC Main10 alike, so keying off it marks every
-                // ordinary clip as deep. `BitsPerComponent` is the real
-                // answer: present and equal to 10 on 10-bit footage, and
-                // absent altogether on 8-bit, which is why the default lives
-                // here rather than in a fallback.
-                depth = extensions?["BitsPerComponent"] as? Int ?? 8
+                // Absent on 8-bit footage, which is why the default lives
+                // here rather than in a fallback. See FormatDescriptions.
+                depth = FormatDescriptions.bitsPerComponent(of: description) ?? 8
+                alpha = FormatDescriptions.hasAlpha(description)
             }
             if kind == .audio, let basic = CMAudioFormatDescriptionGetStreamBasicDescription(description) {
                 channels = Int(basic.pointee.mChannelsPerFrame)
@@ -120,7 +116,7 @@ public enum Probe {
                          duration: duration.isFinite ? duration : 0,
                          bitRate: bitRate,
                          width: size.map { Int($0.width) }, height: size.map { Int($0.height) },
-                         frameRate: rate, bitDepth: depth,
+                         frameRate: rate, bitDepth: depth, hasAlpha: alpha,
                          channels: channels, sampleRate: sampleRate,
                          language: languages == "und" ? nil : languages)
     }

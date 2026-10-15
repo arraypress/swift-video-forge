@@ -18,29 +18,104 @@ try await VideoForge.process(clip, to: reel, options: VideoProcessOptions(
 try await Frames.animate(clip, to: loop, fps: 12, trim: .until(3), maxPixelSize: 480)
 ```
 
-## Two roads
+## Two roads, and a writer for what they cannot do
 
 Which one a job takes is the most consequential thing about it, so
-``VideoProcessResult/passedThrough`` says which one ran.
+``VideoProcessResult/passedThrough`` says whether the frames were left alone.
 
 - **Composition** — trimming, joining, changing speed, dropping a track are
   rearrangements of *time*. An `AVMutableComposition` points at the source's
   samples rather than reading them, so a trim of a two-hour recording is a
   second of work and loses nothing.
 - **Render** — cropping, scaling, turning and mirroring have to redraw every
-  frame. Built on `AVMutableVideoComposition` with a Core Image handler
-  rather than a hand-rolled reader and writer, so audio, subtitle and timed
-  metadata tracks come along untouched and the interleave deadlock cannot be
-  reintroduced by accident.
+  frame. Built on `AVMutableVideoComposition` with a Core Image handler, written
+  by an export session, so audio, subtitle and timed metadata tracks come along
+  untouched.
 
 A job that needs both gets both, with the time work first — so the render road
-only ever sees the frames that survived the trim.
+only ever sees the frames that survived the trim. Both write with the codec
+`ExportSpec.codec` names (see Codecs below).
 
-Both roads write with the codec `ExportSpec.codec` names (see Codecs below).
+**The writer road** (0.5.0) takes over only where an export session cannot be
+told what was asked: a **bitrate**, a **quality** or a **frame rate** (no preset
+takes any of them), and a **ProRes 4444 redraw** (see Codecs). The same Core
+Image composition feeds an `AVAssetReaderVideoCompositionOutput`, and an
+`AVAssetWriter` configured by ``WriterSettings`` writes it; sound and sidecar
+tracks are copied untouched unless time is rescaled. Every other job takes the
+export session exactly as before — measured below.
 
-A third, narrow road adds tracks: **copy** reads every sample of every track
-and writes it back unchanged beside the new ones. It exists for subtitles,
-because the composition road cannot make a subtitle a player will offer.
+A narrow **copy** road adds tracks: it reads every sample of every track and
+writes it back unchanged beside the new ones. It exists for subtitles, because
+the composition road cannot make a subtitle a player will offer.
+
+The writer pieces are public, because swift-censor-kit writes through them too:
+``WriterSettings/derive(from:codec:bitRate:quality:frameRate:size:keepsAlpha:processesInRGB:)``
+(the source's codec story, bitrate, depth, colour tags and pixel format, as a pure
+function) and ``WriterPump`` (feeding several writer inputs on demand, which is
+what keeps a writer from deadlocking on an input it has throttled).
+
+## Bitrate, quality and frame rate (0.5)
+
+```swift
+// A bitrate (VBR target), or a quality, and a frame rate.
+try await VideoForge.process(clip, to: out, options: VideoProcessOptions(
+    operations: [.resize(.height(720))],
+    export: ExportSpec(codec: .hevc, bitRate: 4_000_000, frameRate: 30)))
+```
+
+Up to 0.4.0 `ExportSpec.bitRate`, `quality` and `frameRate` were saved in recipes
+and read by nobody. Measured with ffprobe on `testsrc2` clips (12 s 1080p30 for
+rates, macOS 27, M-series):
+
+| asked bitrate | H.264 | HEVC 8-bit | HEVC Main 10 | HEVC + alpha |
+|---|---|---|---|---|
+| 1 Mb/s | 1.27 | 1.90 | 1.31 | 1.73 |
+| 2 Mb/s | 1.98 | 2.06 | 2.18 | 2.11 |
+| 4 Mb/s | 3.96 | 3.93 | 4.10 | 4.01 |
+| 8 Mb/s | 7.33 | 7.83 | 7.94 | 7.92 |
+| 16 Mb/s | 12.9 | 14.2 | 15.5 | 14.8 |
+
+A VBR target: within 1–8 % from 2 to 8 Mb/s; below what the picture needs the
+encoder floors (HEVC at ~1.9 Mb/s on this pattern), above it the encoder spends
+less than asked.
+
+| quality | 0 | 0.25 | 0.5 | 0.75 | 0.9 | 1 |
+|---|---|---|---|---|---|---|
+| H.264, Mb/s | 1.15 | 1.57 | 4.08 | 11.9 | 22.6 | 36.8 |
+| HEVC, Mb/s | 0.46 | 0.78 | 3.20 | 12.0 | 22.5 | 33.7 |
+| HEVC Main 10, Mb/s | 1.23 | 2.26 | 7.93 | 20.5 | 40.0 | 52.3 |
+
+A bitrate wins over a quality when both are given. With neither — a frame rate
+alone — the source's own rate is asked for, scaled down with a smaller picture,
+never below a floor of 0.05 bits a pixel a frame.
+
+**Frame rate** drops or repeats frames; the clip keeps its length and the sound
+is copied untouched:
+
+| source → asked | frames | video / audio | last frame | kept |
+|---|---|---|---|---|
+| 4 s H.264 60 fps + AAC → 30 | 240 → 120 | 4.000 / 4.000 s | 3.967 s | audio MD5-identical, BT.709 tags |
+| 4 s HEVC Main 10 HLG 24 fps + AAC → 30 | 96 → 120 | 4.000 / 4.000 s | 3.967 s | 10-bit, BT.2020 / HLG tags |
+| 4 s H.264 60 fps → ProRes 422 at 30 | 240 → 120 | 4.000 / 4.000 s | 3.967 s | |
+| 2 s HEVC with alpha 30 fps → 24 | 60 → 48 | 2.000 s | 1.958 s | the alpha (255 / 80 read back) |
+
+**Which codec honours what:** H.264, HEVC and HEVC with alpha take a bitrate, a
+quality and a frame rate. ProRes takes a frame rate only: its encoders refuse a
+bitrate and a quality outright (`canApply` is false), so either one with ProRes
+throws `codecTakesNoRate` before anything is written.
+
+**The other command lines did not move.** Twenty `vid` command lines that ask for
+none of this — a copied trim, re-encoded trims, `--codec hevc`, resize (tagged,
+untagged, 10-bit), crop, rotate, ProRes 422 and 4444 without a redraw, speed with
+`--reencode` and muted, grade, two joins, mute, reverse, music, audio — were run
+through `vid` 0.7.0 and the 0.8.0 build and compared by decoded frames and audio
+(ffmpeg `framemd5`, each side re-run up to 3 times, since VideoToolbox is not
+repeatable). 17 matched. The other 3 differ from 0.7.0 no more than 0.7.0 differs
+from itself: crop's frames are 53.4 dB PSNR from 0.7.0, exactly as far as two 0.7.0
+runs are from each other, and join and `speed --reencode` have identical frames
+and an AAC encoder that gave a different stream on each 0.7.0 run. The deliberate
+differences are the fixes below: passthrough speed with sound, HLG tags, alpha,
+ProRes 4444 redraws, reverse.
 
 ## Codecs
 
@@ -58,7 +133,7 @@ let container = try spec.container(for: info, destination: out) // .mov
 
 | `VideoCodec` | written as | depth | containers |
 |---|---|---|---|
-| `.source` *(default)* | the clip's own: `avc1` → H.264, `hvc1`/`hev1` → HEVC, ProRes → ProRes; anything else → HEVC if 10-bit, H.264 if not | the source's | the source's |
+| `.source` *(default)* | the clip's own: `avc1` → H.264, `hvc1`/`hev1` → HEVC (HEVC with alpha when it carries alpha), ProRes → ProRes; anything else → HEVC if 10-bit, H.264 if not | the source's | the source's |
 | `.h264` | H.264 High | 8-bit | mov, mp4, m4v |
 | `.hevc` | HEVC Main, or **Main 10** from a 10-bit source | 8 or 10 | mov, mp4, m4v |
 | `.hevcAlpha` | HEVC Main with alpha | **8-bit** | mov, mp4, m4v |
@@ -69,7 +144,11 @@ let container = try spec.container(for: info, destination: out) // .mov
 `.hevcAlpha` with a 10-bit source throws `wouldTruncateDepth` before anything is
 written; `.source` keeps 10-bit footage 10-bit, even when the clip's own codec is
 one this library cannot write (it becomes HEVC Main 10). A join is deep if any of
-its clips is. ProRes asked into `.mp4` throws `codecNeedsContainer`; ProRes that
+its clips is. **ProRes's depth is its own, not the footage's:** it declares 12 bits
+(16 with alpha) whatever it was made from — measured on ProRes written by
+AVFoundation from 8-bit H.264 and by ffmpeg — so up to 0.4.0 ProRes made from
+8-bit footage could never go back to H.264. `.source` still keeps ProRes deep, but
+an 8-bit codec asked for by name is allowed from ProRes. ProRes asked into `.mp4` throws `codecNeedsContainer`; ProRes that
 merely inherited `.mp4` from its source is written to `.mov`. Every road honours
 all of this — the export session, a join, `addAudio`, and `reverse`, which reads a
 10-bit source at 10 bits.
@@ -97,11 +176,23 @@ Also measured, and now handled:
   frames came out 27–39 codes brighter, tagged SMPTE 170M with no transfer
   function; H.264 and HEVC tag Rec. 709 and kept every value. A redraw of untagged
   footage is now tagged Rec. 709 — the convention for untagged video — and ProRes
-  keeps every value. A tagged source keeps its own tags.
-- **ProRes 4444 redraws are not full depth.** On the same ramp a ProRes 4444
-  *redraw* keeps 102–112 levels (a copy keeps all of them, as do ProRes 422 and
-  HEVC redraws). That is more than 8 bits could hold (64) but less than the
-  source; for a 10-bit grade, write `.proRes422` or `.hevc`.
+  keeps every value.
+- **A tagged source lost its tags on a redraw** (fixed in 0.5.0). A video
+  composition built over an `AVComposition` — every job, since the time steps
+  come first — picks up no colour tags, so a BT.2020 HLG clip was redrawn and
+  labelled Rec. 709: HDR relabelled as SDR. The tags are now read off the track.
+- **HEVC with alpha lost its alpha to the default codec** (fixed in 0.5.0). It
+  is `hvc1` like any HEVC; only the format description's `ContainsAlphaChannel`
+  tells them apart, and nothing read it, so `.source` meant plain HEVC and a
+  resize wrote no alpha. `TrackInfo.hasAlpha` reads it now, and `.source` keeps it.
+- **ProRes 4444 redraws were not full depth** (fixed in 0.5.0). On the 256-level
+  ramp a 4444 *redraw* through the export session kept 95 levels (a copy kept all,
+  as did ProRes 422 and HEVC redraws). Measured through the writer road, ProRes
+  keeps 95–101 levels from every RGB pixel format the compositor can hand it —
+  32-bit BGRA, 64-bit half float, 16-bit ARGB, 16-bit Y'CbCrA — and 254–264 from
+  10-bit Y'CbCr. So a 4444 redraw now takes the writer road, fed 10-bit 4:4:4
+  Y'CbCr: **255 levels**. Only footage that keeps its alpha still goes through
+  16-bit Y'CbCrA (no 10-bit Y'CbCr format carries alpha), at the old ~100 levels.
 
 ProRes is the fast, large choice. Three seconds of 4K30 test pattern with AAC, `vid` release build on an M3 Max:
 
@@ -193,9 +284,28 @@ UHD, a 1920×1080 with AAC stereo, and a 720p:
 | trim 1s from 4K | **0.01s**, passthrough, **2530× realtime** |
 | 4K → 720 high | 0.28s for two seconds of footage |
 | 4K landscape → 1080×1920 reel | 0.29s |
-| speed 2× / 0.5× / 4× with AAC stereo | **0.0% off** at every factor |
+| speed 2× / 0.5× / 4× with AAC stereo | **0.0% off** at every factor — the *file's* length; see below |
 | GIF, 2s at 10fps, 400px | 0.36–1.71s |
 | reverse a whole 4K clip | refused: 16.8 GB against a 2 GB budget |
+
+**The sound of a passthrough speed change was never re-timed** (fixed in
+0.5.0). The file came out the right length, but a passthrough export copies the
+sound as it is: at 0.5× it wrote 3.02 s of sound under 6 s of picture, MD5-identical
+to the source's, and at 2× the first half of it at normal speed. A speed change
+with sound now copies the video samples (frame for frame, MD5-identical) and sends
+only the sound through a spectral time-pitch pass: 0.5×, 2× and 4× all come out
+with sound exactly as long as the picture, and the job still reports
+`passedThrough`.
+
+**Two more found while measuring** (fixed in 0.5.0): `reverse` dropped the
+display transform, so a phone clip shot upright (360×640 shown) came back lying
+on its side at 640×360; and a join of clips of different sizes, exported with no
+video composition, wrote one sample description per size — AVFoundation played
+it, ffmpeg could not decode past the first clip. Reversed chunks now carry the
+transform, and a mixed-size join is drawn at the first clip's size. `reverse` now
+derives its writer settings like every other writer here, which adds the expected
+frame rate as an encoder hint: on a 10-bit clip its decoded frames moved from
+41.8 to 42.1 dB PSNR against the source.
 
 The trim numbers are the argument for the composition road: bounding a 4K clip
 takes a hundredth of a second and does not touch a pixel.

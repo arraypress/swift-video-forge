@@ -65,9 +65,14 @@ public struct VideoInfo: Sendable, Codable, Equatable, Hashable {
     public var hasAudio: Bool { audio != nil }
     /// Whether there are any pictures.
     public var hasVideo: Bool { video != nil }
-    /// Whether the source is 10-bit or deeper, and so must not be written
-    /// as H.264.
+    /// Whether the video is stored with more than 8 bits per component, so
+    /// "the source's codec" means a deep one.
     public var isDeep: Bool { video?.isDeep ?? false }
+    /// Whether the footage itself is deeper than 8 bits, so an 8-bit codec
+    /// is refused. ProRes's declared depth is its own, not the footage's.
+    public var forbidsEightBit: Bool { video?.forbidsEightBit ?? false }
+    /// Whether the video carries an alpha channel.
+    public var hasAlpha: Bool { video?.hasAlpha ?? false }
 
     /// The frame's size.
     public var size: CGSize { CGSize(width: width, height: height) }

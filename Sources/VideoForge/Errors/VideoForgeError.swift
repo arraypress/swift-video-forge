@@ -41,6 +41,9 @@ public enum VideoForgeError: Error, LocalizedError, Sendable, Equatable {
     /// The codec can only be written to another container — ProRes is
     /// QuickTime only.
     case codecNeedsContainer(codec: VideoCodec, container: VideoContainer)
+    /// A bitrate or a quality was asked of a codec that sets its own —
+    /// ProRes.
+    case codecTakesNoRate(codec: VideoCodec)
     /// The container cannot hold what it was asked to hold.
     case containerCannotHold(VideoContainer, TrackKind)
     /// Joining clips that do not agree on something that matters.
@@ -79,6 +82,8 @@ public enum VideoForgeError: Error, LocalizedError, Sendable, Equatable {
             return "this is 10-bit footage and \(codec.rawValue) is 8-bit — write hevc, proRes422 or proRes4444, or leave the codec as the source's"
         case .codecNeedsContainer(let codec, let container):
             return "\(codec.rawValue) is written only to mov, not \(container.rawValue)"
+        case .codecTakesNoRate(let codec):
+            return "\(codec.rawValue) sets its own bitrate and takes no quality — drop the bitrate and quality, or write hevc or h264"
         case .containerCannotHold(let container, let kind):
             return "\(container.rawValue) cannot hold a \(kind.rawValue) track"
         case .incompatibleClips(let reason):

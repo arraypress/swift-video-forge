@@ -13,7 +13,11 @@
 //    and has to be told how, or it turns 10-bit HDR into 8-bit SDR.
 //
 //  Both write with the codec ``ExportSpec/codec`` names, resolved by
-//  ``CodecPlan``; ``VideoCodec/source`` keeps the source's, depth included.
+//  ``CodecPlan``; ``VideoCodec/source`` keeps the source's, depth and alpha
+//  included. Both write through an export session — unless the job asks
+//  for a bitrate, a quality or a frame rate, which no preset can be told,
+//  or redraws ProRes 4444: those take the WRITER road (``Transcoder``),
+//  a reader and a writer configured by ``WriterSettings``.
 //
 //  ``VideoProcessResult/passedThrough`` says which one ran, because a
 //  caller deserves to know whether their footage was re-encoded.
@@ -69,7 +73,37 @@ public enum VideoForge {
         try check(destination, overwrites: options.overwrites)
         let passesThrough = CodecPlan.passesThrough(options.export, codec: codec,
                                                     sourceCodec: before.video?.codec,
+                                                    sourceAlpha: before.hasAlpha,
                                                     timeOnly: options.isTimeOnly)
+
+        // A bitrate, a quality or a frame rate — which no preset takes — or
+        // a ProRes 4444 redraw: the writer road. Everything else below is
+        // the export session, exactly as before 0.5.0.
+        if CodecPlan.usesWriter(options.export, codec: codec, redraws: !options.isTimeOnly) {
+            guard before.hasVideo else { throw VideoForgeError.noVideoTrack(source) }
+            try await Transcoder.write(.clip(source, operations: options.operations, size: before.size),
+                                       export: options.export, codec: codec,
+                                       container: container, to: destination)
+            return VideoProcessResult(
+                source: source, destination: destination, before: before,
+                after: try await describe(destination), passedThrough: false,
+                operations: options.operations, seconds: -started.timeIntervalSinceNow)
+        }
+
+        // A passthrough speed change with sound: the samples are copied, and
+        // only the sound — which a passthrough export would copy unscaled —
+        // goes through a time-pitch pass. See Transcoder.
+        if passesThrough, CodecPlan.retimesSound(options.operations, keepsAudio: options.export.keepsAudio,
+                                                 hasAudio: before.hasAudio) {
+            try await Transcoder.write(.clip(source, operations: options.operations, size: before.size),
+                                       export: options.export, codec: codec, container: container,
+                                       copiesVideo: true, to: destination)
+            return VideoProcessResult(
+                source: source, destination: destination, before: before,
+                after: try await describe(destination), passedThrough: true,
+                operations: options.operations, seconds: -started.timeIntervalSinceNow)
+        }
+
         let asset = AVURLAsset(url: source)
 
         // The time-only steps first, because trimming before redrawing means
@@ -128,11 +162,25 @@ public enum VideoForge {
                                                 inherited: before.container, codec: codec)
         try check(destination, overwrites: overwrites)
 
-        let composition = try await Composer.concatenate(
-            sources.map { AVURLAsset(url: $0) }, keepsAudio: export.keepsAudio)
-        // Joining re-times the samples, so passthrough is not on offer.
-        try await Composer.export(composition, to: destination, container: container,
-                                  preset: CodecPlan.preset(for: codec))
+        if CodecPlan.usesWriter(export, codec: codec, redraws: false) {
+            try await Transcoder.write(.join(sources, size: before.size), export: export, codec: codec,
+                                       container: container, to: destination)
+        } else {
+            let composition = try await Composer.concatenate(
+                sources.map { AVURLAsset(url: $0) }, keepsAudio: export.keepsAudio)
+            // MEASURED: clips of different sizes, exported with no video
+            // composition, came out as one track with a sample description
+            // per size — ffmpeg could not decode past the first clip. Drawn
+            // through a composition, every frame is the first clip's size.
+            var videoComposition: AVVideoComposition?
+            if Set(clips.map(\.size)).count > 1 {
+                videoComposition = try await Renderer.build(for: composition, operations: [],
+                                                            source: before.size).composition
+            }
+            // Joining re-times the samples, so passthrough is not on offer.
+            try await Composer.export(composition, to: destination, container: container,
+                                      preset: CodecPlan.preset(for: codec), videoComposition: videoComposition)
+        }
 
         return VideoProcessResult(
             source: first, destination: destination, before: before,

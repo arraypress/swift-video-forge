@@ -26,6 +26,12 @@
 //  · The ProRes presets write `apcn` 4:2:2 10-bit and `ap4h` 4:4:4:4
 //    12-bit, and only to QuickTime: `.mov` is their one file type.
 //
+//  0.5.0 added the WRITER road (``Transcoder``) for what the presets cannot
+//  be told — a bitrate, a quality, a frame rate — and for ProRes 4444
+//  redraws, which the export session squeezes through an RGB intermediate
+//  (95 of 256 levels kept; see ``WriterRules``). Every other job takes the
+//  export session exactly as before.
+//
 
 import AVFoundation
 import Foundation
@@ -60,22 +66,73 @@ enum CodecPlan {
     ///   - sourceCodec: The source's four-character code, if known.
     ///   - deep: Whether the source carries more than 8 bits.
     /// - Returns: A concrete codec — never ``VideoCodec/source``.
-    static func resolve(_ wanted: VideoCodec, sourceCodec: String?, deep: Bool) -> VideoCodec {
+    static func resolve(_ wanted: VideoCodec, sourceCodec: String?, deep: Bool,
+                        alpha: Bool = false) -> VideoCodec {
         guard wanted == .source else { return wanted }
-        if let own = sourceCodec.flatMap(codec(named:)), !deep || own.isDeep { return own }
+        if let own = sourceCodec.flatMap({ codec(named: $0, alpha: alpha) }), !deep || own.isDeep { return own }
         return deep ? .hevc : .h264
+    }
+
+    /// The codec a track is written in, alpha included: HEVC with alpha is
+    /// `hvc1` like any HEVC, and only the format description's
+    /// `ContainsAlphaChannel` tells them apart. Before 0.5.0 it was read as
+    /// plain HEVC, so a redraw "in the source's codec" dropped the alpha.
+    ///
+    /// - Parameters:
+    ///   - fourCharacterCode: The track's format.
+    ///   - alpha: Whether the track carries alpha.
+    /// - Returns: The codec, or nil for one this library does not write.
+    static func codec(named fourCharacterCode: String, alpha: Bool) -> VideoCodec? {
+        let plain = codec(named: fourCharacterCode)
+        return plain == .hevc && alpha ? .hevcAlpha : plain
     }
 
     /// Refuses to write deep footage with an 8-bit encoder.
     ///
     /// - Parameters:
     ///   - codec: The concrete codec to write.
-    ///   - deep: Whether the source carries more than 8 bits.
+    ///   - deep: Whether the source's own codec says its footage is deeper
+    ///     than 8 bits — ``VideoInfo/forbidsEightBit``, not merely
+    ///     ``VideoInfo/isDeep``: ProRes declares 12 bits whatever it was made
+    ///     from, so ProRes made from 8-bit footage could not go back to H.264.
     /// - Throws: ``VideoForgeError/wouldTruncateDepth(codec:)``.
     static func checkDepth(_ codec: VideoCodec, deep: Bool) throws {
         if deep, !codec.isDeep, codec != .source {
             throw VideoForgeError.wouldTruncateDepth(codec: codec)
         }
+    }
+
+    /// Refuses a bitrate or a quality for a codec that takes neither.
+    ///
+    /// MEASURED: the ProRes encoders refuse a compression dictionary holding
+    /// `AVVideoAverageBitRateKey` or `AVVideoQualityKey` (`canApply` is
+    /// false); each ProRes flavour has its own fixed rate.
+    ///
+    /// - Parameters:
+    ///   - spec: The export settings.
+    ///   - codec: The concrete codec.
+    /// - Throws: ``VideoForgeError/codecTakesNoRate(codec:)``.
+    static func checkRates(_ spec: ExportSpec, codec: VideoCodec) throws {
+        if codec.isIntraFrame, spec.bitRate != nil || spec.quality != nil {
+            throw VideoForgeError.codecTakesNoRate(codec: codec)
+        }
+    }
+
+    /// Whether a job goes through the writer road rather than an export
+    /// session.
+    ///
+    /// Only when the export session cannot do what was asked: a bitrate, a
+    /// quality or a frame rate (no preset takes any of them), or a ProRes
+    /// 4444 redraw (the preset's compositor keeps 95 of 256 10-bit levels).
+    /// Everything else takes the export session, as before 0.5.0.
+    ///
+    /// - Parameters:
+    ///   - spec: The export settings.
+    ///   - codec: The concrete codec.
+    ///   - redraws: Whether frames are redrawn.
+    /// - Returns: Whether to use the writer road.
+    static func usesWriter(_ spec: ExportSpec, codec: VideoCodec, redraws: Bool) -> Bool {
+        spec.asksForEncoding || (redraws && codec == .proRes4444)
     }
 
     /// The export preset that writes a codec.
@@ -95,20 +152,34 @@ enum CodecPlan {
     /// Whether a time-only job may copy samples rather than re-encode.
     ///
     /// Only when nothing asks for a change: the codec is the source's own
-    /// (asked for by name or as ``VideoCodec/source``), and neither a bit
-    /// rate nor a frame rate was given.
+    /// (asked for by name or as ``VideoCodec/source``), and no bitrate,
+    /// quality or frame rate was given.
     ///
     /// - Parameters:
     ///   - spec: The export settings.
     ///   - codec: The concrete codec the job writes.
     ///   - sourceCodec: The source's four-character code, if known.
+    ///   - sourceAlpha: Whether the source carries alpha.
     ///   - timeOnly: Whether every operation was time-only.
     /// - Returns: Whether the passthrough preset can be used.
     static func passesThrough(_ spec: ExportSpec, codec: VideoCodec,
-                              sourceCodec: String?, timeOnly: Bool) -> Bool {
-        guard timeOnly, spec.prefersPassthrough,
-              spec.bitRate == nil, spec.frameRate == nil else { return false }
-        return spec.codec == .source || sourceCodec.flatMap(self.codec(named:)) == codec
+                              sourceCodec: String?, sourceAlpha: Bool = false, timeOnly: Bool) -> Bool {
+        guard timeOnly, spec.prefersPassthrough, !spec.asksForEncoding else { return false }
+        return spec.codec == .source || sourceCodec.flatMap({ self.codec(named: $0, alpha: sourceAlpha) }) == codec
+    }
+
+    /// Whether a job changes the speed of sound it keeps — which a
+    /// passthrough export cannot do: it copies the sound unscaled.
+    ///
+    /// - Parameters:
+    ///   - operations: The job's steps.
+    ///   - keepsAudio: Whether the sound is kept.
+    ///   - hasAudio: Whether the source has any.
+    /// - Returns: Whether the sound needs a time-pitch pass.
+    static func retimesSound(_ operations: [VideoOperation], keepsAudio: Bool, hasAudio: Bool) -> Bool {
+        guard keepsAudio, hasAudio else { return false }
+        if operations.contains(where: { $0 == .remove(.audio) }) { return false }
+        return operations.contains { if case .speed(let rate) = $0 { return rate != 1 } else { return false } }
     }
 
     /// The container a job writes.

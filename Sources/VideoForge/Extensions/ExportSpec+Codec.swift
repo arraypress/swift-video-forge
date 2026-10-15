@@ -20,7 +20,9 @@ public extension ExportSpec {
     /// - Parameter source: The clip being written.
     /// - Returns: A concrete codec — never ``VideoCodec/source``.
     /// - Throws: ``VideoForgeError/wouldTruncateDepth(codec:)`` when a
-    ///   10-bit source is asked to be written by an 8-bit codec.
+    ///   10-bit source is asked to be written by an 8-bit codec, and
+    ///   ``VideoForgeError/codecTakesNoRate(codec:)`` for a bitrate or a
+    ///   quality with ProRes.
     func codec(for source: VideoInfo) throws -> VideoCodec {
         try codec(forClips: [source])
     }
@@ -30,11 +32,17 @@ public extension ExportSpec {
     ///
     /// - Parameter sources: The clips, in order.
     /// - Returns: A concrete codec.
-    /// - Throws: ``VideoForgeError/wouldTruncateDepth(codec:)``.
+    /// - Throws: ``VideoForgeError/wouldTruncateDepth(codec:)``,
+    ///   ``VideoForgeError/codecTakesNoRate(codec:)``.
     func codec(forClips sources: [VideoInfo]) throws -> VideoCodec {
         let deep = sources.contains(where: \.isDeep)
-        let resolved = CodecPlan.resolve(codec, sourceCodec: sources.first?.video?.codec, deep: deep)
-        try CodecPlan.checkDepth(resolved, deep: deep)
+        // Alpha is kept only when every clip has it: a join of one clip with
+        // alpha and one without has nothing to say for the second.
+        let alpha = !sources.isEmpty && sources.allSatisfy(\.hasAlpha)
+        let resolved = CodecPlan.resolve(codec, sourceCodec: sources.first?.video?.codec,
+                                         deep: deep, alpha: alpha)
+        try CodecPlan.checkDepth(resolved, deep: sources.contains(where: \.forbidsEightBit))
+        try CodecPlan.checkRates(self, codec: resolved)
         return resolved
     }
 

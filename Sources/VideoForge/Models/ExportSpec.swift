@@ -20,10 +20,12 @@ public struct ExportSpec: Sendable, Codable, Equatable, Hashable {
     /// Bits per second for the video. Nil derives it from the source, never
     /// below what the source itself used.
     public var bitRate: Int?
-    /// A quality from 0 to 1, as a friendlier way of asking for a bitrate.
-    /// Ignored when ``bitRate`` is set.
-    public var quality: Double
-    /// Frames per second. Nil keeps the source's.
+    /// An encoder quality from 0 to 1, for H.264 and HEVC. Nil leaves the
+    /// rate to ``bitRate`` or to the source; ignored when ``bitRate`` is set.
+    /// ProRes takes neither and refuses both.
+    public var quality: Double?
+    /// Frames per second. Nil keeps the source's. Frames are dropped or
+    /// repeated to meet it; the duration and the sound are unchanged.
     public var frameRate: Double?
     /// Whether to keep the audio.
     public var keepsAudio: Bool
@@ -40,7 +42,7 @@ public struct ExportSpec: Sendable, Codable, Equatable, Hashable {
     ///   - container: The container to write, or nil to keep the source's.
     ///   - codec: The codec to write.
     ///   - bitRate: Bits per second, or nil to derive from the source.
-    ///   - quality: A quality from 0 to 1, used when no bitrate is given.
+    ///   - quality: An encoder quality from 0 to 1, or nil.
     ///   - frameRate: Frames per second, or nil to keep the source's.
     ///   - keepsAudio: Whether to keep the sound.
     ///   - keepsSidecarTracks: Whether to carry subtitles and metadata through.
@@ -48,7 +50,7 @@ public struct ExportSpec: Sendable, Codable, Equatable, Hashable {
     public init(container: VideoContainer? = nil,
                 codec: VideoCodec = .source,
                 bitRate: Int? = nil,
-                quality: Double = 0.8,
+                quality: Double? = nil,
                 frameRate: Double? = nil,
                 keepsAudio: Bool = true,
                 keepsSidecarTracks: Bool = true,
@@ -56,12 +58,16 @@ public struct ExportSpec: Sendable, Codable, Equatable, Hashable {
         self.container = container
         self.codec = codec
         self.bitRate = bitRate
-        self.quality = min(1, max(0.05, quality))
+        self.quality = quality.map { min(1, max(0, $0)) }
         self.frameRate = frameRate
         self.keepsAudio = keepsAudio
         self.keepsSidecarTracks = keepsSidecarTracks
         self.prefersPassthrough = prefersPassthrough
     }
+
+    /// Whether this asks for something only an encoder can be told — a
+    /// bitrate, a quality or a frame rate — which no export preset takes.
+    public var asksForEncoding: Bool { bitRate != nil || quality != nil || frameRate != nil }
 
     /// Write this container, keeping everything else.
     public static func container(_ container: VideoContainer) -> ExportSpec {
