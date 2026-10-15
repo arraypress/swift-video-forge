@@ -42,8 +42,13 @@ enum Remuxer {
         let format: CMFormatDescription
         let languageCode: String?
         let extendedLanguageTag: String?
+        /// For a subtitle track, whether players show it unasked; for any
+        /// other, whether the track is enabled.
         let isDefault: Bool
         let samples: [Sample]
+        /// A metadata track that describes the video (`cdsc`), to be linked
+        /// to the written video track again.
+        var describesVideo = false
     }
 
     /// One made sample: when it shows, and its bytes.
@@ -67,14 +72,18 @@ enum Remuxer {
 
     // MARK: - Reading the plan
 
-    /// What to carry from `asset`: every track, or every one but the
-    /// subtitles when they are being replaced.
-    static func plan(_ asset: AVAsset, droppingSubtitles: Bool) async throws
+    /// The media types that are subtitles, to drop when they are replaced.
+    static let subtitleTypes: Set<AVMediaType> = [.subtitle, .closedCaption]
+
+    /// What to carry from `asset`: every track but those of the `dropping`
+    /// media types — the subtitles when they are being replaced, the sound
+    /// when a mix replaces it.
+    static func plan(_ asset: AVAsset, dropping: Set<AVMediaType> = []) async throws
         -> (tracks: [CopiedTrack], associations: [Association]) {
         var copied: [CopiedTrack] = []
         var associations: [Association] = []
         for track in try await asset.load(.tracks) {
-            if droppingSubtitles, [.subtitle, .closedCaption].contains(track.mediaType) { continue }
+            if dropping.contains(track.mediaType) { continue }
             let (formats, transform, language, tag, enabled) = try await track.load(
                 .formatDescriptions, .preferredTransform, .languageCode, .extendedLanguageTag, .isEnabled)
             copied.append(CopiedTrack(trackID: track.trackID, mediaType: track.mediaType,
@@ -100,10 +109,10 @@ enum Remuxer {
     ///   `CancellationError` when the task is cancelled — the partial file
     ///   is removed either way.
     static func remux(_ source: URL, copying: [CopiedTrack], associations: [Association],
-                      adding: [MadeTrack],
+                      adding: [MadeTrack], sound: MixedSound? = nil,
                       to url: URL, fileType: AVFileType) async throws -> [AVMediaType] {
         let (job, refused) = try await makeJob(source, copying: copying, associations: associations,
-                                               adding: adding, to: url, fileType: fileType)
+                                               adding: adding, sound: sound, to: url, fileType: fileType)
         try await WriterPump.run(job)
         return refused
     }
@@ -111,7 +120,7 @@ enum Remuxer {
     /// Builds the reader, the writer, their inputs and the feeds. Everything
     /// is made or loaded here, so it can be handed to the pump whole.
     private static func makeJob(_ source: URL, copying: [CopiedTrack], associations: [Association],
-                                    adding: [MadeTrack],
+                                    adding: [MadeTrack], sound: MixedSound?,
                                     to url: URL, fileType: AVFileType) async throws -> sending (WriterJob, [AVMediaType]) {
         let asset = AVURLAsset(url: source)
         let reader: AVAssetReader
@@ -158,7 +167,9 @@ enum Remuxer {
             if mediaType == .audio { audioInputs.append((input, copied.isEnabled)) }
         }
 
-        subtitleInputs += try add(adding, to: writer, feeds: &feeds, url: url)
+        if let sound { feeds.append(try await sound.feed(into: writer, url: url)) }
+        let video = copying.first { $0.mediaType == .video }.flatMap { inputsByTrack[$0.trackID] }
+        subtitleInputs += try add(adding, to: writer, feeds: &feeds, url: url, video: video)
 
         for association in associations {
             guard let from = inputsByTrack[association.from], let to = inputsByTrack[association.to],
@@ -183,25 +194,39 @@ enum Remuxer {
 
     /// Adds an input for each made track, and a feed that writes it.
     ///
-    /// - Returns: The inputs, each with whether it is the default — for the
-    ///   caller to put in an alternate group.
+    /// - Parameters:
+    ///   - made: The tracks.
+    ///   - writer: The writer to add them to.
+    ///   - feeds: Where their feeds go.
+    ///   - url: The destination, for errors.
+    ///   - video: The written video track, for a metadata track that
+    ///     describes it to be linked to.
+    /// - Returns: The SUBTITLE inputs, each with whether it is the default —
+    ///   for the caller to put in an alternate group.
     /// - Throws: ``VideoForgeError/writeFailed(_:reason:)`` when the writer
     ///   refuses a track.
     static func add(_ made: [MadeTrack], to writer: AVAssetWriter, feeds: inout [WriterFeed],
-                    url: URL) throws -> [(input: AVAssetWriterInput, isDefault: Bool)] {
-        try made.map { track in
+                    url: URL, video: AVAssetWriterInput?) throws -> [(input: AVAssetWriterInput, isDefault: Bool)] {
+        var subtitles: [(input: AVAssetWriterInput, isDefault: Bool)] = []
+        for track in made {
             let input = AVAssetWriterInput(mediaType: track.mediaType, outputSettings: nil,
                                            sourceFormatHint: track.format)
             input.expectsMediaDataInRealTime = false
             if let language = track.languageCode { input.languageCode = language }
             if let tag = track.extendedLanguageTag { input.extendedLanguageTag = tag }
+            if track.mediaType != .subtitle { input.marksOutputTrackAsEnabled = track.isDefault }
             guard writer.canAdd(input) else {
                 throw VideoForgeError.writeFailed(url, reason: "the writer refused a \(TrackKind.describing(track.mediaType)) track")
             }
             writer.add(input)
+            let link = AVAssetTrack.AssociationType.metadataReferent.rawValue
+            if track.describesVideo, let video, input.canAddTrackAssociation(withTrackOf: video, type: link) {
+                input.addTrackAssociation(withTrackOf: video, type: link)
+            }
             feeds.append(madeFeed(track, into: input, url: url))
-            return (input, track.isDefault)
+            if track.mediaType == .subtitle { subtitles.append((input, track.isDefault)) }
         }
+        return subtitles
     }
 
     /// A feed that writes made samples, in order.
@@ -211,7 +236,7 @@ enum Remuxer {
             guard next < made.samples.count else { return false }
             defer { next += 1 }
             guard let buffer = sampleBuffer(made.samples[next], format: made.format) else {
-                throw VideoForgeError.writeFailed(url, reason: "a subtitle sample could not be made")
+                throw VideoForgeError.writeFailed(url, reason: "a \(TrackKind.describing(made.mediaType)) sample could not be made")
             }
             input.append(buffer)
             return true

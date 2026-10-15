@@ -191,7 +191,9 @@ final class CodecTests: XCTestCase {
     func testMusicUnderTenBitFootageLeavesItTenBit() async throws {
         let music = out("music.caf")
         try TestClips.writeAudio(to: music, seconds: 2)
-        let result = try await VideoForge.addAudio(to: deep, music: music, destination: out("scored.mov"))
+        let result = try await VideoForge.addMusic(music, to: deep, destination: out("scored.mov")).result
+        // The picture is copied, so it cannot have lost a bit.
+        XCTAssertTrue(result.passedThrough)
         XCTAssertEqual(result.after.video?.codec, "hvc1")
         XCTAssertTrue(result.after.isDeep)
         XCTAssertTrue(result.after.hasAudio)

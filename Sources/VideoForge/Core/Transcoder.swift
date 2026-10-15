@@ -20,7 +20,8 @@
 //  change, or a join of clips whose sound may not agree, decodes the sound
 //  through a spectral time-pitch pass and encodes it again: AAC, or 32-bit
 //  float PCM beside ProRes, as its presets write. Subtitle and timed
-//  metadata tracks are copied, re-timed by the reader with the edits.
+//  metadata tracks are written from their samples, cut and re-timed by
+//  their edits (SubtitleRetiming).
 //
 //  The same road carries a PASSTHROUGH speed change with sound: the video
 //  samples are copied (frame for frame, MD5-identical) and only the sound
@@ -47,6 +48,8 @@ enum Transcoder {
         case clip(URL, operations: [VideoOperation], size: CGSize)
         /// Clips end to end; `size` is the first one's frame as shown.
         case join([URL], size: CGSize)
+        /// One clip over another (Overlaying).
+        case overlay(Overlaying.Job)
     }
 
     /// Writes a timeline.
@@ -76,8 +79,10 @@ enum Transcoder {
         let operations: [VideoOperation]
         let shown: CGSize
         let composition: AVMutableComposition
-        var subtitles: [Remuxer.MadeTrack] = []
+        var sidecars: [Remuxer.MadeTrack] = []
         var placements: [ClipPlacement] = []
+        var drawn: AVVideoComposition?
+        var audioMix: AVAudioMix?
         switch timeline {
         case .clip(let source, let steps, let size):
             (first, operations, shown) = (source, steps, size)
@@ -85,11 +90,11 @@ enum Transcoder {
             composition = try await Composer.build(
                 from: asset, operations: steps, keepsAudio: export.keepsAudio,
                 keepsSidecarTracks: export.keepsSidecarTracks)
-            // Subtitles are written from re-timed samples, not read through
-            // the composition: the reader hands them back un-cut and in
-            // media time (SubtitleRetiming).
-            subtitles = container.holdsSubtitles
-                ? try await VideoForge.detachSubtitles(from: composition, of: asset, url: source) : []
+            // Subtitles and timed metadata are written from re-timed
+            // samples, not read through the composition: the reader hands
+            // them back un-cut and in media time (SubtitleRetiming).
+            sidecars = container.holdsSubtitles
+                ? try await VideoForge.detachSparseTracks(from: composition, of: asset, url: source) : []
         case .join(let sources, let size):
             guard let head = sources.first else {
                 throw VideoForgeError.incompatibleClips(reason: "no clips were given")
@@ -97,12 +102,21 @@ enum Transcoder {
             (first, operations, shown) = (head, [], size)
             (composition, placements) = try await Composer.concatenate(sources.map { AVURLAsset(url: $0) },
                                                                        keepsAudio: export.keepsAudio)
+            sidecars = export.keepsSidecarTracks
+                ? try await VideoForge.joinedSubtitles(sources, container: container) : []
+        case .overlay(let job):
+            (first, operations, shown) = (job.main, [], job.frame)
+            let built = try await Overlaying.build(job, export: export, container: container)
+            (composition, drawn, audioMix, sidecars) = (built.composition, built.videoComposition,
+                                                        built.audioMix, built.sidecars)
         }
-        // Time rescaled, or sound from several files: the sound is decoded
-        // rather than copied.
+        // Time rescaled, sound from several files, or two sounds mixed: the
+        // sound is decoded rather than copied.
         let decodesAudio: Bool
-        if case .join = timeline { decodesAudio = true } else {
-            decodesAudio = operations.contains { if case .speed = $0 { return true } else { return false } }
+        switch timeline {
+        case .join: decodesAudio = true
+        case .overlay: decodesAudio = audioMix != nil
+        case .clip: decodesAudio = operations.contains { if case .speed = $0 { return true } else { return false } }
         }
 
         let sourceAsset = AVURLAsset(url: first)
@@ -116,6 +130,7 @@ enum Transcoder {
         }
         writer.metadata = (try? await sourceAsset.load(.metadata)) ?? []
         var feeds: [WriterFeed] = []
+        var videoInput: AVAssetWriterInput?
 
         // The pictures.
         if copiesVideo {
@@ -133,12 +148,15 @@ enum Transcoder {
                 reader.add(output)
                 writer.add(input)
                 feeds.append(.copying(from: output, to: input))
+                videoInput = videoInput ?? input
             }
         } else {
-            feeds.append(try await redrawnVideo(composition, operations: operations, shown: shown,
-                                                placements: placements, source: sourceAsset,
+            let redrawn = try await redrawnVideo(composition, operations: operations, shown: shown,
+                                                placements: placements, drawn: drawn, source: sourceAsset,
                                                 export: export, codec: codec,
-                                                reader: reader, writer: writer, url: url))
+                                                reader: reader, writer: writer, url: url)
+            feeds.append(redrawn)
+            videoInput = redrawn.input
         }
 
         // The sound. Its rate is read off the SOURCE: a composition track
@@ -148,7 +166,23 @@ enum Transcoder {
             sourceRates.append(Double(try await track.load(.estimatedDataRate)))
         }
         var audioInputs: [AVAssetWriterInput] = []
-        for (index, track) in try await composition.loadTracks(withMediaType: .audio).enumerated() {
+        let sounds = try await composition.loadTracks(withMediaType: .audio)
+        if let audioMix, let lead = sounds.first {
+            // Two sounds mixed into one track, by the job's own mix.
+            let mixed = AVAssetReaderAudioMixOutput(audioTracks: sounds, audioSettings: AudioRules.decoded)
+            mixed.audioMix = audioMix
+            var settings = AudioRules.encoded(like: try await lead.load(.formatDescriptions).first,
+                                              bitRate: sourceRates.first ?? 0, codec: codec)
+            if !writer.canApply(outputSettings: settings, forMediaType: .audio) { settings[AVEncoderBitRateKey] = nil }
+            let input = AVAssetWriterInput(mediaType: .audio, outputSettings: settings)
+            input.expectsMediaDataInRealTime = false
+            if reader.canAdd(mixed), writer.canAdd(input) {
+                reader.add(mixed)
+                writer.add(input)
+                feeds.append(.copying(from: mixed, to: input))
+            }
+        }
+        for (index, track) in sounds.enumerated() where audioMix == nil {
             let description = try await track.load(.formatDescriptions).first
             let rate = index < sourceRates.count ? sourceRates[index] : (sourceRates.first ?? 0)
             let output: AVAssetReaderOutput
@@ -177,26 +211,9 @@ enum Transcoder {
         }
         if audioInputs.count > 1 { writer.addAlternateGroup(audioInputs, defaultInput: audioInputs[0]) }
 
-        // Timed metadata, copied as it is — the reader re-times a scaled
-        // edit's samples, as it does the video's. A track the writer will
-        // not take is left out and shows in `lostTracks`.
-        for track in try await composition.loadTracks(withMediaType: .metadata) {
-            let (descriptions, language, enabled) = try await track.load(
-                .formatDescriptions, .languageCode, .isEnabled)
-            let output = AVAssetReaderTrackOutput(track: track, outputSettings: nil)
-            let input = AVAssetWriterInput(mediaType: .metadata, outputSettings: nil,
-                                           sourceFormatHint: descriptions.first)
-            input.expectsMediaDataInRealTime = false
-            if let language, language != "und" { input.languageCode = language }
-            input.marksOutputTrackAsEnabled = enabled
-            guard reader.canAdd(output), writer.canAdd(input) else { continue }
-            reader.add(output)
-            writer.add(input)
-            feeds.append(.copying(from: output, to: input))
-        }
-        // Subtitles, from their re-timed samples, in one group as players
-        // need them.
-        let subtitleInputs = try Remuxer.add(subtitles, to: writer, feeds: &feeds, url: url)
+        // Subtitles and timed metadata, from their re-timed samples; the
+        // subtitles in one group, as players need them.
+        let subtitleInputs = try Remuxer.add(sidecars, to: writer, feeds: &feeds, url: url, video: videoInput)
         writer.addAlternateGroup(subtitleInputs.map(\.input),
                                  defaultInput: subtitleInputs.first(where: \.isDefault)?.input)
 
@@ -206,7 +223,7 @@ enum Transcoder {
     /// Image compositor, in the pixel format and settings derived for the
     /// codec, at the frame rate asked for.
     private static func redrawnVideo(_ composition: AVComposition, operations: [VideoOperation],
-                                     shown: CGSize, placements: [ClipPlacement],
+                                     shown: CGSize, placements: [ClipPlacement], drawn: AVVideoComposition?,
                                      source: AVAsset, export: ExportSpec,
                                      codec: VideoCodec, reader: AVAssetReader, writer: AVAssetWriter,
                                      url: URL) async throws -> WriterFeed {
@@ -215,15 +232,23 @@ enum Transcoder {
         }
         var format = try await VideoSourceFormat.load(from: sourceTrack)
 
-        let (videoComposition, renderSize) = try await Renderer.build(
-            for: composition, operations: operations, source: shown, placements: placements)
-        if let fps = export.frameRate {
-            // MEASURED: a Core Image composition times its frames by the
-            // source track (`sourceTrackIDForFrameTiming`), so a frame
-            // duration alone changed nothing — 60 fps in, 240 frames of 60
-            // out. Timing by the frame duration is what resamples.
-            videoComposition.sourceTrackIDForFrameTiming = kCMPersistentTrackID_Invalid
-            videoComposition.frameDuration = WriterRules.frameDuration(fps: fps)
+        let videoComposition: AVVideoComposition
+        let renderSize: CGSize
+        if let drawn {
+            // Built whole by its job, frame rate included.
+            (videoComposition, renderSize) = (drawn, drawn.renderSize)
+        } else {
+            let (built, size) = try await Renderer.build(
+                for: composition, operations: operations, source: shown, placements: placements)
+            if let fps = export.frameRate {
+                // MEASURED: a Core Image composition times its frames by the
+                // source track (`sourceTrackIDForFrameTiming`), so a frame
+                // duration alone changed nothing — 60 fps in, 240 frames of 60
+                // out. Timing by the frame duration is what resamples.
+                built.sourceTrackIDForFrameTiming = kCMPersistentTrackID_Invalid
+                built.frameDuration = WriterRules.frameDuration(fps: fps)
+            }
+            (videoComposition, renderSize) = (built, size)
         }
         // The composition's tags: the source's own, or Rec. 709 said
         // outright for an untagged source (see Renderer).

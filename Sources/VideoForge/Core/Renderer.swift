@@ -21,6 +21,7 @@
 
 import AVFoundation
 import CoreImage
+import FaceBeauty
 import VideoGrade
 import CoreGraphics
 import Foundation
@@ -104,6 +105,12 @@ public enum Renderer {
         /// filter chain — which bakes a 32³ colour cube — in each of those
         /// would dominate the run.
         let grade: GradeFilter?
+        /// Skin smoothing, built once.
+        let skin: SkinSmoothFilter?
+        /// The face retouch and its landmark track.
+        let retouch: FaceBeautyFilter?
+        /// The background blur.
+        let background: BackgroundBlurFilter?
         /// The size the composition renders at.
         let outputSize: CGSize
 
@@ -118,6 +125,9 @@ public enum Renderer {
             var mirror: VideoFlip?
             var scaleTo = size
             var look: GradeFilter?
+            var smoothing: SkinSmoothFilter?
+            var retouching: FaceBeautyFilter?
+            var blurring: BackgroundBlurFilter?
 
             for operation in operations where !operation.isTimeOnly {
                 switch operation {
@@ -185,11 +195,21 @@ public enum Renderer {
                             reason: "the grade could not be built: \(error.localizedDescription)")
                     }
 
+                case .beauty(let beauty):
+                    if beauty.smoothing > 0 { smoothing = SkinSmoothFilter(intensity: min(1, beauty.smoothing)) }
+                    retouching = FaceBeautyFilter(beauty: beauty.retouch)
+
+                case .blurBackground(let blur):
+                    if blur.amount > 0 { blurring = BackgroundBlurFilter(settings: blur) }
+
                 default:
                     break
                 }
             }
 
+            skin = smoothing
+            retouch = retouching
+            background = blurring
             crop = cropRect
             scale = scaleTo
             rotation = turn
@@ -207,6 +227,18 @@ public enum Renderer {
         /// - Returns: The frame to write.
         func apply(to image: CIImage, at time: TimeInterval = 0) -> CIImage {
             var output = image
+            // Faces and people first, in the frame as it was shot: the
+            // landmark track and the segmentation are in its coordinates.
+            // MEASURED: where the picture ends before the sound, the
+            // composition asks for frames with no source — an image of
+            // infinite extent — and a mask scaled to it came back nil, which
+            // AVFoundation answers with an uncaught exception. Such a frame
+            // has nothing to find.
+            if !output.extent.isInfinite {
+                if let retouch { output = retouch.apply(output, at: time, sourceSize: output.extent.size) }
+                if let skin { output = skin.apply(output) }
+                if let background { output = background.apply(output) }
+            }
 
             // A fill-resize scales first and crops the overflow; every other
             // crop takes its rectangle out of the source. Both are handled

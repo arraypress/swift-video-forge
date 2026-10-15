@@ -63,7 +63,8 @@ extension VideoForge {
         let made = try madeTracks(subtitles, within: before.duration)
         try check(destination, overwrites: overwrites)
 
-        let plan = try await Remuxer.plan(AVURLAsset(url: source), droppingSubtitles: replacingExisting)
+        let plan = try await Remuxer.plan(AVURLAsset(url: source),
+                                            dropping: replacingExisting ? Remuxer.subtitleTypes : [])
         _ = try await Remuxer.remux(source, copying: plan.tracks, associations: plan.associations,
                                     adding: made, to: destination, fileType: container.fileType)
 
@@ -76,72 +77,155 @@ extension VideoForge {
     /// The tracks to write for `subtitles` in a movie `duration` seconds
     /// long: languages checked, cues cut to the movie, samples encoded.
     static func madeTracks(_ subtitles: [Subtitles], within duration: Double) throws -> [Remuxer.MadeTrack] {
-        let format = try TX3G.formatDescription()
-        return try subtitles.map { track in
+        try subtitles.map { track in
             guard let codes = SubtitleLanguage.codes(for: track.language) else {
                 throw VideoForgeError.invalidSubtitles("'\(track.language)' is not a language code — use one like en, ja or pt-BR")
             }
-            let pieces = SubtitleTimeline.pieces(of: track.cues, within: duration)
-            guard pieces.contains(where: { !$0.text.isEmpty }) else {
+            guard let made = try madeTrack(track.cues, codes: codes, isDefault: track.isDefault, within: duration) else {
                 throw VideoForgeError.invalidSubtitles(
                     "no \(track.language) cue falls inside the video's \(String(format: "%.1f", duration)) s")
             }
-            let samples = try pieces.map { piece in
-                Remuxer.Sample(
-                    range: CMTimeRange(start: CMTime(seconds: piece.start, preferredTimescale: 1000),
-                                       end: CMTime(seconds: piece.end, preferredTimescale: 1000)),
-                    data: try TX3G.encode(piece.text))
+            return made
+        }
+    }
+
+    /// One tx3g track for `cues` in a movie `duration` seconds long, or nil
+    /// when no cue falls inside it.
+    static func madeTrack(_ cues: [SubtitleCue], codes: (iso639: String, bcp47: String?)?, isDefault: Bool,
+                          within duration: Double) throws -> Remuxer.MadeTrack? {
+        let pieces = SubtitleTimeline.pieces(of: cues, within: duration)
+        guard pieces.contains(where: { !$0.text.isEmpty }) else { return nil }
+        let samples = try pieces.map { piece in
+            Remuxer.Sample(
+                range: CMTimeRange(start: CMTime(seconds: piece.start, preferredTimescale: 1000),
+                                   end: CMTime(seconds: piece.end, preferredTimescale: 1000)),
+                data: try TX3G.encode(piece.text))
+        }
+        return Remuxer.MadeTrack(mediaType: .subtitle, format: try TX3G.formatDescription(),
+                                 languageCode: codes?.iso639, extendedLanguageTag: codes?.bcp47,
+                                 isDefault: isDefault, samples: samples)
+    }
+
+    /// The subtitle tracks of clips joined end to end: each clip's cues
+    /// moved to where the clip starts, cut at its end, and laid in one track
+    /// per language — a clip with no track in a language leaves that track
+    /// empty for its length. A clip's second English track joins the
+    /// others' second English track.
+    ///
+    /// Up to 0.6.0 a join dropped every subtitle track (it showed only in
+    /// `lostTracks`). The cues are read and written again as tx3g, so a
+    /// track's styling is not kept; its text and timing are.
+    ///
+    /// - Parameters:
+    ///   - sources: The clips, in order.
+    ///   - container: The container being written.
+    /// - Returns: The tracks; none when no clip has a readable track.
+    /// - Throws: ``VideoForgeError`` when a clip's track cannot be read.
+    static func joinedSubtitles(_ sources: [URL], container: VideoContainer) async throws -> [Remuxer.MadeTrack] {
+        guard container.holdsSubtitles else { return [] }
+        struct Lane {
+            let language: String?
+            let isClosedCaption: Bool
+            let ordinal: Int
+            var cues: [SubtitleCue]
+            let isEnabled: Bool
+        }
+        var lanes: [Lane] = []
+        var offset = 0.0
+        for source in sources {
+            let length = try await AVURLAsset(url: source).load(.duration).seconds
+            let tracks: [SubtitleTrack]
+            do { tracks = try await subtitles(in: source) } catch VideoForgeError.noSubtitleTrack { tracks = [] }
+            var seen: [String: Int] = [:]
+            for track in tracks where track.isReadable {
+                let key = "\(track.language ?? "")|\(track.isClosedCaption)"
+                let ordinal = seen[key, default: 0]
+                seen[key] = ordinal + 1
+                let moved = track.cues.filter { $0.start < length }.map {
+                    SubtitleCue(start: $0.start + offset, end: min($0.end, length) + offset, text: $0.text)
+                }
+                if let index = lanes.firstIndex(where: {
+                    $0.language == track.language && $0.isClosedCaption == track.isClosedCaption && $0.ordinal == ordinal
+                }) {
+                    lanes[index].cues += moved
+                } else {
+                    lanes.append(Lane(language: track.language, isClosedCaption: track.isClosedCaption,
+                                      ordinal: ordinal, cues: moved, isEnabled: track.isEnabled))
+                }
             }
-            return Remuxer.MadeTrack(mediaType: .subtitle, format: format, languageCode: codes.iso639,
-                                     extendedLanguageTag: codes.bcp47, isDefault: track.isDefault,
-                                     samples: samples)
+            offset += length
+        }
+        // One default at most: the first track any clip showed unasked.
+        let preferred = lanes.firstIndex(where: \.isEnabled)
+        return try lanes.enumerated().compactMap { index, lane in
+            try madeTrack(lane.cues, codes: lane.language.flatMap(SubtitleLanguage.codes(for:)),
+                          isDefault: index == preferred, within: offset)
         }
     }
 
     // MARK: - Carrying through a job
 
-    /// Takes the subtitle tracks out of a composition and returns them as
-    /// tracks to write from samples, each sample cut and re-timed through
-    /// the composition's edits — a trim, a speed change.
+    /// Takes the subtitle and timed-metadata tracks out of a composition
+    /// and returns them as tracks to write from samples, each sample cut and
+    /// re-timed through the composition's edits — a trim, a speed change.
     ///
     /// Why not leave them in: a composition export cannot cut a sample, so
     /// a trim inside one writes an edit list that ffmpeg and
     /// `AVAssetReader` misread by the length of the cut (SubtitleRetiming).
     /// And a re-encoding export drops subtitle tracks altogether.
     ///
+    /// MEASURED (0.7.0): timed metadata has the same fault. One 0.5 s
+    /// sample every half second, trimmed 0.25 s in: AVPlayer and the
+    /// metadata adaptor read each sample where it was, ffprobe put every
+    /// one 0.25 s early (`elst` media time 250 again); trimmed 1.6 s in, 0.4 s
+    /// early. A trim on a sample boundary, and a speed change, read right.
+    /// Every road lost the track's link to the video it describes, too
+    /// (`cdsc`); a made track is linked to the written video again.
+    ///
     /// - Parameters:
     ///   - composition: The composition, built from `asset`. Its subtitle
-    ///     tracks are removed.
+    ///     and metadata tracks are removed.
     ///   - asset: The source the composition reads.
     ///   - url: The source's file, for errors.
-    /// - Returns: The tracks, in the composition's order.
+    /// - Returns: The tracks, subtitles first, each kind in the
+    ///   composition's order.
     /// - Throws: ``VideoForgeError/unreadable(_:reason:)`` when a track
     ///   cannot be read.
-    static func detachSubtitles(from composition: AVMutableComposition, of asset: AVURLAsset,
-                                url: URL) async throws -> [Remuxer.MadeTrack] {
+    static func detachSparseTracks(from composition: AVMutableComposition, of asset: AVURLAsset,
+                                   url: URL) async throws -> [Remuxer.MadeTrack] {
         var made: [Remuxer.MadeTrack] = []
-        for track in composition.tracks(withMediaType: .subtitle) {
-            let segments = track.segments ?? []
-            composition.removeTrack(track)
-            guard let sourceID = segments.first(where: { !$0.isEmpty })?.sourceTrackID,
-                  let source = try await asset.loadTrack(withTrackID: sourceID) else { continue }
-            let (formats, language, tag, enabled, timescale) = try await source.load(
-                .formatDescriptions, .languageCode, .extendedLanguageTag, .isEnabled, .naturalTimeScale)
-            guard let format = formats.first else { continue }
-            var samples = SubtitleRetiming.retime(
-                try await samples(of: source, in: asset, url: url),
-                through: segments.map { SubtitleRetiming.Segment($0) },
-                timescale: timescale > 0 ? timescale : 1000)
-            // A tx3g track is given a gap sample from zero rather than an
-            // empty edit; other formats keep what they have.
-            if CMFormatDescriptionGetMediaSubType(format) == kCMSubtitleFormatType_3GText {
-                samples = SubtitleRetiming.filledFromZero(samples, gap: try TX3G.encode(""))
+        for mediaType in [AVMediaType.subtitle, .metadata] {
+            for track in composition.tracks(withMediaType: mediaType) {
+                let segments = track.segments ?? []
+                composition.removeTrack(track)
+                guard let sourceID = segments.first(where: { !$0.isEmpty })?.sourceTrackID,
+                      let source = try await asset.loadTrack(withTrackID: sourceID) else { continue }
+                let (formats, language, tag, enabled, timescale) = try await source.load(
+                    .formatDescriptions, .languageCode, .extendedLanguageTag, .isEnabled, .naturalTimeScale)
+                guard let format = formats.first else { continue }
+                // The raw reader hands metadata back in media time too, edit
+                // ignored — measured on a trimmed file — so both kinds are
+                // read the same way.
+                var samples = SubtitleRetiming.retime(
+                    try await samples(of: source, in: asset, url: url),
+                    through: segments.map { SubtitleRetiming.Segment($0) },
+                    timescale: timescale > 0 ? timescale : 1000)
+                // A tx3g track is given a gap sample from zero rather than an
+                // empty edit; other formats keep what they have.
+                if CMFormatDescriptionGetMediaSubType(format) == kCMSubtitleFormatType_3GText {
+                    samples = SubtitleRetiming.filledFromZero(samples, gap: try TX3G.encode(""))
+                }
+                guard !samples.isEmpty else { continue }
+                let describesVideo = mediaType == .metadata
+                    ? try await source.loadAssociatedTracks(ofType: .metadataReferent)
+                        .contains { $0.mediaType == .video }
+                    : false
+                made.append(Remuxer.MadeTrack(
+                    mediaType: mediaType, format: format,
+                    languageCode: language.flatMap { $0 == "und" ? nil : $0 },
+                    extendedLanguageTag: tag, isDefault: enabled, samples: samples,
+                    describesVideo: describesVideo))
             }
-            guard !samples.isEmpty else { continue }
-            made.append(Remuxer.MadeTrack(
-                mediaType: .subtitle, format: format,
-                languageCode: language.flatMap { $0 == "und" ? nil : $0 },
-                extendedLanguageTag: tag, isDefault: enabled, samples: samples))
         }
         return made
     }

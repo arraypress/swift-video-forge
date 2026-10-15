@@ -53,6 +53,10 @@ public enum VideoForgeError: Error, LocalizedError, Sendable, Equatable {
     case invalidSubtitles(String)
     /// The movie holds no subtitle or caption track.
     case noSubtitleTrack(URL)
+    /// A picture-in-picture or a music bed asked for something that cannot
+    /// be done — an overlay that starts after the movie ends, a size out of
+    /// range.
+    case invalidOptions(String)
 
     /// A lowercase phrase that reads inside a sentence, for a CLI or a log.
     public var errorDescription: String? {
@@ -92,6 +96,8 @@ public enum VideoForgeError: Error, LocalizedError, Sendable, Equatable {
             return reason
         case .noSubtitleTrack(let url):
             return "\(url.lastPathComponent) has no subtitle or caption track"
+        case .invalidOptions(let reason):
+            return reason
         }
     }
 }

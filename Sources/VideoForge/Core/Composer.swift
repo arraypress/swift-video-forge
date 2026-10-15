@@ -181,10 +181,12 @@ public enum Composer {
     ///   - container: The file type.
     ///   - preset: The export preset. Passthrough where the caller allows it.
     ///   - videoComposition: The per-frame work, when there is any.
+    ///   - audioMix: How several sound tracks are mixed, when they are.
     /// - Throws: ``VideoForgeError/exportFailed(reason:)``.
     public static func export(_ composition: AVComposition, to url: URL,
                               container: VideoContainer, preset: String,
-                              videoComposition: AVVideoComposition? = nil) async throws {
+                              videoComposition: AVVideoComposition? = nil,
+                              audioMix: AVAudioMix? = nil) async throws {
         guard let session = AVAssetExportSession(asset: composition, presetName: preset) else {
             // The preset's own name, without AVFoundation's prefix on it.
             let name = preset.replacingOccurrences(of: "AVAssetExportPreset", with: "")
@@ -192,6 +194,7 @@ public enum Composer {
         }
         session.audioTimePitchAlgorithm = .spectral
         session.videoComposition = videoComposition
+        session.audioMix = audioMix
         // The composition knows the intended duration exactly; the export
         // does not, once audio time-pitch is involved. See the note at the
         // top of this file — this one line is the difference between 1.50s

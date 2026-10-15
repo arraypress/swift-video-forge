@@ -272,8 +272,7 @@ final class VideoForgeTests: XCTestCase {
         let music = out("music.caf")
         try TestClips.writeAudio(to: music, seconds: 5, hz: 220)
 
-        let result = try await VideoForge.addAudio(to: silent, music: music,
-                                                   destination: out("scored.mov"))
+        let result = try await VideoForge.addMusic(music, to: silent, destination: out("scored.mov")).result
         XCTAssertTrue(result.after.hasAudio)
         XCTAssertEqual(result.after.duration, 2, accuracy: 0.1,
                        "music longer than the picture is trimmed to it")

@@ -65,6 +65,9 @@ public enum VideoForge {
                                options: VideoProcessOptions) async throws -> VideoProcessResult {
         let started = Date()
         let before = try await describe(source)
+        // A retouch follows a landmark track, made before the frames are.
+        var options = options
+        options.operations = try await tracked(options.operations, source: source, duration: before.duration)
         // The codec first, before anything is touched on disk: it can refuse
         // the job (10-bit into an 8-bit encoder), and it decides the
         // container (ProRes is QuickTime only).
@@ -113,7 +116,7 @@ public enum VideoForge {
             keepsAudio: options.export.keepsAudio,
             keepsSidecarTracks: options.export.keepsSidecarTracks)
         let subtitles = container.holdsSubtitles
-            ? try await detachSubtitles(from: composition, of: asset, url: source) : []
+            ? try await detachSparseTracks(from: composition, of: asset, url: source) : []
 
         // MEASURED: the HEVC-with-alpha preset will not COPY a source that
         // has no alpha (-11838), but redraws one without complaint — so a
@@ -183,8 +186,10 @@ public enum VideoForge {
                                                             placements: placements).composition
             }
             // Joining re-times the samples, so passthrough is not on offer.
-            try await Composer.export(composition, to: destination, container: container,
-                                      preset: CodecPlan.preset(for: codec), videoComposition: videoComposition)
+            let subtitles = export.keepsSidecarTracks
+                ? try await joinedSubtitles(sources, container: container) : []
+            try await Self.export(composition, carrying: subtitles, to: destination, container: container,
+                             preset: CodecPlan.preset(for: codec), videoComposition: videoComposition)
         }
 
         return VideoProcessResult(
@@ -259,88 +264,32 @@ public enum VideoForge {
         return try await describe(destination)
     }
 
-    /// Puts a soundtrack under a movie, replacing whatever it had.
-    ///
-    /// The music is trimmed to the movie's length; a movie longer than its
-    /// music keeps playing in silence rather than being cut short, because
-    /// the picture is what somebody came for.
-    ///
-    /// - Parameters:
-    ///   - source: The movie.
-    ///   - music: The audio to lay under it.
-    ///   - destination: Where to write.
-    ///   - keepsOriginalAudio: Keep the movie's own sound as well.
-    ///   - overwrites: Whether an existing file may be replaced.
-    /// - Returns: What happened.
-    /// - Throws: Any ``VideoForgeError``.
-    @discardableResult
-    public static func addAudio(to source: URL, music: URL, destination: URL,
-                                keepsOriginalAudio: Bool = false,
-                                overwrites: Bool = false) async throws -> VideoProcessResult {
-        let started = Date()
-        let before = try await describe(source)
-        // The picture is re-encoded in its own codec — a 10-bit clip under
-        // new music stays 10-bit.
-        let spec = ExportSpec()
-        let codec = try spec.codec(for: before)
-        let container = try spec.container(for: before, destination: destination)
-        try check(destination, overwrites: overwrites)
-
-        let asset = AVURLAsset(url: source)
-        let musicAsset = AVURLAsset(url: music)
-        guard let musicTrack = try await musicAsset.loadTracks(withMediaType: .audio).first else {
-            throw VideoForgeError.noAudioTrack(music)
-        }
-
-        let composition = try await Composer.build(
-            from: asset, operations: [], keepsAudio: keepsOriginalAudio,
-            keepsSidecarTracks: true)
-        let subtitles = container.holdsSubtitles
-            ? try await detachSubtitles(from: composition, of: asset, url: source) : []
-
-        if let added = composition.addMutableTrack(withMediaType: .audio,
-                                                   preferredTrackID: kCMPersistentTrackID_Invalid) {
-            let musicDuration = try await musicAsset.load(.duration)
-            let take = CMTimeMinimum(musicDuration, composition.duration)
-            try added.insertTimeRange(CMTimeRange(start: .zero, duration: take),
-                                      of: musicTrack, at: .zero)
-        }
-
-        try await export(composition, carrying: subtitles, to: destination, container: container,
-                         preset: CodecPlan.preset(for: codec))
-
-        return VideoProcessResult(
-            source: source, destination: destination, before: before,
-            after: try await describe(destination), passedThrough: false,
-            operations: [], seconds: -started.timeIntervalSinceNow)
-    }
-
     // MARK: - Writing
 
     /// Exports a composition — and when it had subtitle tracks, taken out
-    /// by ``detachSubtitles(from:of:url:)``, copies the export into
+    /// by ``detachSparseTracks(from:of:url:)``, copies the export into
     /// `destination` with them written back from their re-timed samples.
     ///
     /// The copy is the remuxer's: every sample of the export, byte for
     /// byte, its edits included — measured on a passthrough trim, the
     /// decoded frames and sound are identical before and after it. It costs
     /// one more pass over the file, and only when there are subtitles.
-    static func export(_ composition: AVMutableComposition, carrying subtitles: [Remuxer.MadeTrack],
+    static func export(_ composition: AVMutableComposition, carrying sidecars: [Remuxer.MadeTrack],
                        to destination: URL, container: VideoContainer, preset: String,
-                       videoComposition: AVVideoComposition? = nil) async throws {
-        guard !subtitles.isEmpty else {
+                       videoComposition: AVVideoComposition? = nil, audioMix: AVAudioMix? = nil) async throws {
+        guard !sidecars.isEmpty else {
             return try await Composer.export(composition, to: destination, container: container,
-                                             preset: preset, videoComposition: videoComposition)
+                                             preset: preset, videoComposition: videoComposition, audioMix: audioMix)
         }
         // Beside the destination, so the copy stays on one volume.
         let staged = destination.deletingLastPathComponent()
             .appendingPathComponent(".\(UUID().uuidString).\(container.fileExtension)")
         defer { try? FileManager.default.removeItem(at: staged) }
         try await Composer.export(composition, to: staged, container: container,
-                                  preset: preset, videoComposition: videoComposition)
-        let plan = try await Remuxer.plan(AVURLAsset(url: staged), droppingSubtitles: true)
+                                  preset: preset, videoComposition: videoComposition, audioMix: audioMix)
+        let plan = try await Remuxer.plan(AVURLAsset(url: staged), dropping: Remuxer.subtitleTypes)
         _ = try await Remuxer.remux(staged, copying: plan.tracks, associations: plan.associations,
-                                    adding: subtitles, to: destination, fileType: container.fileType)
+                                    adding: sidecars, to: destination, fileType: container.fileType)
     }
 
     // MARK: - Guards

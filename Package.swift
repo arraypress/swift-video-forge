@@ -22,6 +22,8 @@ let package = Package(
         // tools already share, so a subtitle track in and out of a movie is
         // the same cue everywhere.
         .package(url: "https://github.com/arraypress/swift-subtitle-kit.git", from: "0.1.0"),
+        // Landmark-driven face retouching, for `beautify`.
+        .package(url: "https://github.com/arraypress/swift-face-beauty.git", from: "0.1.0"),
     ],
     targets: [
         .target(
@@ -30,9 +32,12 @@ let package = Package(
                 .product(name: "ImageForge", package: "swift-image-forge"),
                 .product(name: "VideoGrade", package: "swift-video-grade"),
                 .product(name: "SubtitleKit", package: "swift-subtitle-kit"),
+                .product(name: "FaceBeauty", package: "swift-face-beauty"),
             ]
         ),
-        .testTarget(name: "VideoForgeTests", dependencies: ["VideoForge"]),
+        // Resources holds one synthetic portrait (imagine --fast), for the
+        // picture-in-picture tests to find a face in.
+        .testTarget(name: "VideoForgeTests", dependencies: ["VideoForge"], resources: [.copy("Resources")]),
     ]
 )
 

@@ -51,6 +51,12 @@ public enum VideoOperation: Sendable, Codable, Equatable {
     /// the animated parts of a look — grain, light leaks, film damage — are
     /// given the frame's own time, so they move rather than sitting still.
     case grade(VideoGrade)
+    /// Soften the skin of the faces in frame and retouch the largest one:
+    /// see ``Beauty``. Its landmarks are tracked from the clip by
+    /// ``VideoForge/process(_:to:options:)``.
+    case beauty(Beauty)
+    /// Blur what is behind the people in frame: see ``BackgroundBlur``.
+    case blurBackground(BackgroundBlur)
 
     /// Whether this step can be done by rearranging time alone, leaving
     /// every frame exactly as it was.
@@ -62,7 +68,7 @@ public enum VideoOperation: Sendable, Codable, Equatable {
     public var isTimeOnly: Bool {
         switch self {
         case .trim, .speed, .remove: return true
-        case .reverse, .resize, .crop, .aspect, .rotate, .flip, .grade: return false
+        case .reverse, .resize, .crop, .aspect, .rotate, .flip, .grade, .beauty, .blurBackground: return false
         }
     }
 
@@ -71,7 +77,7 @@ public enum VideoOperation: Sendable, Codable, Equatable {
     public var changesGeometry: Bool {
         switch self {
         case .resize, .crop, .aspect, .rotate: return true
-        case .trim, .speed, .reverse, .flip, .remove, .grade: return false
+        case .trim, .speed, .reverse, .flip, .remove, .grade, .beauty, .blurBackground: return false
         }
     }
 
@@ -89,6 +95,9 @@ public enum VideoOperation: Sendable, Codable, Equatable {
         case .remove(let kind): return "remove \(kind.rawValue)"
         case .grade(let grade):
             return grade.lutURL.map { "grade with \($0.lastPathComponent)" } ?? "grade"
+        case .beauty(let beauty): return String(format: "smooth skin %g", beauty.smoothing)
+            + (beauty.retouches ? ", retouch" : "")
+        case .blurBackground(let blur): return String(format: "blur the background %g", blur.amount)
         }
     }
 }

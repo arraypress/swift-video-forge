@@ -16,6 +16,14 @@ try await VideoForge.process(clip, to: reel, options: VideoProcessOptions(
 
 // A GIF out of the first three seconds.
 try await Frames.animate(clip, to: loop, fps: 12, trim: .until(3), maxPixelSize: 480)
+
+// A reaction cam in whichever corner covers no face.
+let pip = try await VideoForge.pictureInPicture(talk, overlay: cam, to: out)
+pip.placement.faceCoverage   // 0
+
+// Music under the speech, ducked 10 dB while somebody talks.
+let scored = try await VideoForge.addMusic(song, to: talk, destination: out2)
+scored.loudness              // −18.3, measured on the written file
 ```
 
 ## Two roads, and a writer for what they cannot do
@@ -292,6 +300,210 @@ track, and a passthrough trim left it in alternate group 0, where players hide
 it. Reading goes through the track's edits too, so a file trimmed by 0.5.0, or
 by anything else that writes such an edit, reads as it plays.
 
+### Timed metadata through a trim (0.7.0)
+
+Timed metadata had the subtitles' fault, MEASURED on a clip with one 0.5 s
+boxed sample every half second, linked to its video (`cdsc`):
+
+| job | ffprobe 0.6.0 | ffprobe 0.7.0 | link to the video |
+|---|---|---|---|
+| trim `--from 0.25` | every sample 0.25 s early (first at −0.5) | first 0.000–0.250, the rest exact | lost → kept |
+| trim `--from 1.6` | 0.4 s early | first 0.000–0.400, exact | lost → kept |
+| trim 0.25 s on the writer road (`--bitrate`) | 0.25 s early | exact | lost → kept |
+| trim `--from 1.0`, speed 2× | exact | exact | lost → kept |
+
+AVPlayer and `AVAssetReaderOutputMetadataAdaptor` were right all along; the
+raw `AVAssetReaderTrackOutput` hands metadata back in media time, as it does
+subtitles. So metadata tracks now take the subtitles' road: taken out of the
+composition, cut and re-timed through its edits, written back with a plain
+edit, and linked to the written video again.
+
+### Joins keep their subtitles (0.7.0)
+
+Up to 0.6.0 `join` dropped every subtitle track (it showed only in
+`lostTracks`). Each clip's cues are now moved to where that clip starts and
+cut at its end — a cue running past its clip stops there — and laid in one
+track per language (a clip's second English track joins the others' second);
+a clip with no track in a language leaves a gap. The first track any clip
+showed by default stays the default. Read back by ffmpeg and by
+`subtitles(in:)` alike, on the export and writer roads. The cues are read and
+written again as `tx3g`, so styling is not kept; text and timing are.
+
+## Picture-in-picture (0.7.0)
+
+```swift
+let done = try await VideoForge.pictureInPicture(talk, overlay: cam, to: out,
+    options: PictureInPicture(start: 2, end: 8, roundness: 0.1))
+done.placement.corner        // .topLeft
+done.placement.rect          // (29, 29, 384, 288), pixels from the top left
+done.placement.faceCoverage  // 0: it covers no face it saw
+```
+
+`PictureInPicture` holds `start`/`end` (seconds on the main clip), `corner`
+(`.auto` by default), `size` (its width as a share of the frame's; a tall
+overlay is shrunk to fit), `margin`, `roundness`, `fullFrame` (a cut-away,
+scaled to cover and cropped from the centre), `fade` and `mix` (its own sound,
+muted by default). The main clip decides the result — frame, length, sound,
+subtitles and timed metadata — and the codec plan's rules hold: a 10-bit or
+HDR main clip stays 10-bit or HDR, and refuses an 8-bit codec.
+
+**The automatic corner is found by looking.** Nine frames under the overlay's
+stretch are searched for faces with swift-image-forge's Vision detector, and
+the corner covering the smallest share of any face wins; ties go to the corner
+farthest from every face, then bottom right. No threshold: a corner covers
+part of a face or it does not.
+
+It is drawn by a custom compositor (`OverlayCompositor`): the Core Image
+composition the render road uses hands its handler one source frame, and an
+overlay needs two. Each track's frames come as stored, so each is turned
+upright by its own transform (a phone's portrait overlay is not laid on its
+side). It is written through the export session, or — for a bitrate, a
+quality, a frame rate or ProRes 4444 — the writer road and its shared
+WriterPump.
+
+MEASURED, blind — the overlay found where the written frame differs from the
+main clip, the faces by Vision:
+
+| check | result |
+|---|---|
+| asked rect `[29,29,384,288]` (720p, `--at 2-8`), from the frame difference | `[29,29,385,289]` |
+| first and last frame with the overlay, `--at 2-8` at 30 fps | frames 60 and 239 — 2.000 s, 7.967 s |
+| `start: 0.51, end: 1.49` | frames 16–44, exactly |
+| face in the bottom-right: corner chosen, faces seen, covered | top left (or bottom left), 9 in 9 frames, 0 |
+| Vision on the written frame: a face meeting the overlay | none |
+| PSNR outside the overlay, against the source (8-bit H.264) | 36.6 dB — the render road's own redraws: 35.4 |
+| 10-bit HLG main: codec, depth, tags | HEVC Main 10, HLG / BT.2020 kept; 226 of a ramp's 256 levels with the overlay in frame, 254 without |
+| an SDR overlay's 75% grey (Y′ 720) over HLG | written at Y′ 625 — converted, not pasted as SDR codes |
+| overlay sound at `mix: 0.5` | −16.5 dB under the main tone's −10.5, within 1 dB; −50 dB and below when muted |
+
+Three things found on the way: the compositor's sources are half-float RGB
+because every Y′CbCr arrangement measured worse (33.3–35.4 dB outside the
+overlay) and an untagged clip's Y′CbCr was read with the wrong matrix; Core
+Image's colour management stays on because AVFoundation hands each source over
+in its own colour space; and a main clip whose picture ends before its sound
+gets black frames for the rest, rather than failing the export.
+
+## Music under speech (0.7.0)
+
+```swift
+let done = try await VideoForge.addMusic(song, to: talk, destination: out,
+    bed: MusicBed(level: -12, duck: 10, loops: true))
+done.speech       // [1.50...5.36, 8.56...12.22, 13.92...17.66]
+done.loudness     // −18.3 LUFS, measured on the written file
+done.truePeak     // −2.6 dBTP
+```
+
+Every number is measured, none guessed:
+
+1. **Speech** is found on-device (`SpeechDetection`, below).
+2. **The level is set against the speech.** The clip's speech and the music
+   are both measured (ITU-R BS.1770: K-weighted, gated), and the music gained
+   to sit `level` LU under the voice between sentences — so a loudly mastered
+   song and a quiet one land in the same place. With no voice it is set
+   against the clip's loudness; with no sound kept, against −16 LUFS.
+3. **The duck** is a straight line in decibels: the music starts down
+   `attack` before each sentence, so it is all the way down as the first
+   word lands, and comes back over `release`. Sentences closer than attack +
+   release are one, so it does not bob between them.
+4. **The peak.** The mix is made once to find its true peak (4× oversampled)
+   and turned down as a whole if it would pass −1.5 dBTP; then made again and
+   written. The written file is decoded and measured; a peak over −1 dBTP
+   after encoding is written again, quieter by the overshoot.
+5. **The picture is copied**, with subtitles and timed metadata — only the
+   sound is new. Music shorter than the clip ends (or `loops`, each join an
+   equal-power crossfade of up to 1 s); `fadeIn`, `fadeOut` and `start` shape it.
+
+MEASURED on three `say` sentences over a test pattern, the "music" carrying a
+9.5 kHz tone the voices leave alone, read by a single-bin DFT in 0.25 s
+windows inside the sentences (37) and between them (9); loudness checked
+against ffmpeg's `ebur128` filter:
+
+| asked | duck measured on the file | loudness (ffmpeg) | true peak (ffmpeg) |
+|---|---|---|---|
+| duck 10 | 10.10 dB | −18.3 (−18.2) LUFS | −2.6 (−2.6) dBTP |
+| duck 6 | 6.18 dB | −18.2 (−18.2) | −2.4 (−2.4) |
+| duck 18, level −6 | 18.05 dB | −18.4 (−18.3) | −2.6 (−2.6) |
+| a clip peaking +0.7 dBTP, music at +6 LU | mix turned down 14.3 dB | −12.0 (−12.0) | −1.5 (−1.5) |
+
+Two musics 20 dB apart land within 0.5 dB of each other. Every video frame's
+MD5 is the source's (180 of 180). A 19 s clip takes 0.5 s.
+
+### Finding speech
+
+| detection | F1, worst–best | edges | claps and chord swells in the gaps |
+|---|---|---|---|
+| `energy` — speech-band loudness against the room's quiet | 0.872–0.998 | 8–43 ms | ducked under (precision 0.77) |
+| `classifier` — Apple's sound classifier, 0.5 s windows | 0.975–0.986 | 47–83 ms | ignored |
+| **`both`** (the default) — energy frames the classifier hears a voice in | **0.987–0.998** | **8–42 ms** | ignored (precision 0.98) |
+
+Six `say` sentences in four voices with gaps of 0.8–3 s, scored every 10 ms
+against where each sentence was placed, over digital silence, room noise at
+−45 dBFS, noise at −32 dBFS, music at −30 dBFS, and claps and chords in the
+gaps. Each threshold was swept, not chosen: the energy margin (3–15 dB; 4.5
+kept, within 0.002 F1 of the best and with headroom for uneven noise), the
+bridge between words (0.2–0.5 s; 0.5), the classifier's window (its own 3 s
+scored 0.81–0.83 — a second of blur either side; 1 s 0.92; 0.5 s 0.98) and how
+far past a voice the energy may reach (0–0.25 s; 0.05). A classifier window
+speaks for its middle, not its whole length: counting all of it put edges 2.1 s
+out.
+
+### Sound effects, in the same mix (0.7.0)
+
+```swift
+let done = try await VideoForge.addSounds(
+    [SoundCue(file: whoosh, time: 3.2), SoundCue(file: hit, time: 7.5, gain: -3)],
+    to: talk, destination: out)
+done.sounds[0].level        // −23.1 LUFS: 6 under the speech around it (−17.1)
+```
+
+One-shot effects go through the same mixer as the bed — `soundtrack(_:…)` takes
+music and effects together and writes them in one pass, the picture copied.
+Each effect is levelled against the speech within 3 s of it (its BS.1770
+loudness there; with no speech, the clip's sound there; with no sound,
+−16 LUFS): its loudest 400 ms — or all of a shorter one — sits `underSpeech`
+(6 LU) under it, plus its own `gain` and the shared one. The mix's true peak
+is held under −1 dBTP as for music, and each effect's level as mixed is
+reported. MEASURED with a 1 kHz tone for the clip and a 1.25 kHz burst for the
+effect, read apart on the written file by a single-bin DFT: asked 6 and 3 dB
+under, they came out 6.64 and 3.64; the clip's loudness and true peak match
+ffmpeg's `ebur128` to 0.1.
+
+## Beauty and background blur (0.7.0)
+
+```swift
+// Skin smoothed, under-eyes and teeth lifted a little, nothing reshaped.
+try await VideoForge.beautify(talk, to: out, beauty: Beauty(smoothing: 0.5))
+// The people sharp, everything behind them soft.
+try await VideoForge.process(talk, to: out2, options: VideoProcessOptions(
+    operations: [.blurBackground(BackgroundBlur(amount: 0.5))]))
+```
+
+`.beauty` smooths skin with swift-video-grade's skin filter — Vision finds
+the faces in every frame, a skin-tone key keeps eyes, brows, lips and hair
+sharp — and retouches the largest face with
+[swift-face-beauty](https://github.com/arraypress/swift-face-beauty), following
+its landmarks tracked four times a second (re-timed through any trim or speed
+change in the same job). `.blurBackground` finds the people with Vision's
+person segmentation — no depth model, nothing to download — and blurs the
+rest, up to 4% of the frame's height. Both run in the frame as shot, before
+any crop or turn, and both are redraws on the render road.
+
+MEASURED on a synthetic portrait (made by `imagine --fast`; nobody's
+likeness) over a fine grain, 720p — texture is a frame less its 5×5 mean:
+
+| check | result |
+|---|---|
+| smoothing 0.5: cheek texture left | 51% |
+| smoothing 1.0: cheek texture left | 12% |
+| outside the face, PSNR against the source | 42.77 dB at 0.5 and 42.74 at 1.0 — an untouched redraw: 42.77 |
+| background blur 0.5: background texture left | 1.7% |
+| … the person's texture left (ProRes) | 98.9% |
+
+Through H.264 the person kept 93%: the encoder's rate control, not the pass —
+the same two jobs written as ProRes keep it all. A frame of infinite extent
+(where a clip's picture ends before its sound) is passed over rather than
+masked, which up to the first build crashed AVFoundation.
+
 ## Measured
 
 Everything here was measured on macOS 27 before the code was written, and two
@@ -379,12 +591,15 @@ stops lining up. Every size this library produces is even.
 - **Animated formats.** [ImageForge](https://github.com/arraypress/swift-image-forge)
   already writes GIF, APNG and animated HEIF with the per-frame delay handling
   they need. This library produces frames and hands them over.
-- **Anything with a model behind it** — captions, censoring, text extraction —
-  which are their own tools.
+- **Anything with a downloaded model behind it** — captions, censoring, text
+  extraction, depth — which are their own tools. What is here uses what the
+  OS ships: Vision's faces and people, SoundAnalysis's classifier.
 
 ## Requirements
 
-macOS 26+ / iOS 26+, Swift 6.2 (Xcode 26).
+macOS 26+ / iOS 26+, Swift 6.2 (Xcode 26). The tests read one committed
+fixture, `Tests/VideoForgeTests/Resources/face.jpg` — a synthetic portrait —
+and call `/usr/bin/say` for speech.
 
 ## License
 

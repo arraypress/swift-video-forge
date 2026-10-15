@@ -1,6 +1,15 @@
 {
-  "originHash" : "3711dc0d076caf6490100ab2d57ffbee4bdbbd5cffa71a0999f2b3a0d23a264b",
+  "originHash" : "c2f78662eb3c93b087ffe435652f78732fd33f8abb85cf8903cd776d5dd683a9",
   "pins" : [
+    {
+      "identity" : "swift-face-beauty",
+      "kind" : "remoteSourceControl",
+      "location" : "https://github.com/arraypress/swift-face-beauty.git",
+      "state" : {
+        "revision" : "4047743b721e89709a92d641d8b0d151f35e13bc",
+        "version" : "0.1.0"
+      }
+    },
     {
       "identity" : "swift-image-forge",
       "kind" : "remoteSourceControl",
