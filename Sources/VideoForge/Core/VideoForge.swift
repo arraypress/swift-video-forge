@@ -12,6 +12,9 @@
 //  · The RENDER road redraws every frame — crop, scale, turn, reverse —
 //    and has to be told how, or it turns 10-bit HDR into 8-bit SDR.
 //
+//  Both write with the codec ``ExportSpec/codec`` names, resolved by
+//  ``CodecPlan``; ``VideoCodec/source`` keeps the source's, depth included.
+//
 //  ``VideoProcessResult/passedThrough`` says which one ran, because a
 //  caller deserves to know whether their footage was re-encoded.
 //
@@ -58,12 +61,15 @@ public enum VideoForge {
                                options: VideoProcessOptions) async throws -> VideoProcessResult {
         let started = Date()
         let before = try await describe(source)
+        // The codec first, before anything is touched on disk: it can refuse
+        // the job (10-bit into an 8-bit encoder), and it decides the
+        // container (ProRes is QuickTime only).
+        let codec = try options.export.codec(for: before)
+        let container = try options.export.container(for: before, destination: destination)
         try check(destination, overwrites: options.overwrites)
-
-        let container = options.export.container
-            ?? before.container
-            ?? VideoContainer.named(fileExtension: destination.pathExtension)
-            ?? .mov
+        let passesThrough = CodecPlan.passesThrough(options.export, codec: codec,
+                                                    sourceCodec: before.video?.codec,
+                                                    timeOnly: options.isTimeOnly)
         let asset = AVURLAsset(url: source)
 
         // The time-only steps first, because trimming before redrawing means
@@ -73,21 +79,24 @@ public enum VideoForge {
             keepsAudio: options.export.keepsAudio,
             keepsSidecarTracks: options.export.keepsSidecarTracks)
 
+        // MEASURED: the HEVC-with-alpha preset will not COPY a source that
+        // has no alpha (-11838), but redraws one without complaint — so a
+        // time-only job written as hevcAlpha goes through an empty render.
         var videoComposition: AVVideoComposition?
-        if !options.isTimeOnly {
+        if !options.isTimeOnly || (!passesThrough && codec == .hevcAlpha) {
             guard before.hasVideo else { throw VideoForgeError.noVideoTrack(source) }
             videoComposition = try await Renderer.build(
                 for: composition, operations: options.operations, source: before.size).composition
         }
 
-        let preset = Composer.preset(for: options.export, timeOnly: options.isTimeOnly)
+        let preset = passesThrough ? AVAssetExportPresetPassthrough : CodecPlan.preset(for: codec)
         try await Composer.export(composition, to: destination, container: container,
                                   preset: preset, videoComposition: videoComposition)
 
         return VideoProcessResult(
             source: source, destination: destination, before: before,
             after: try await describe(destination),
-            passedThrough: preset == AVAssetExportPresetPassthrough,
+            passedThrough: passesThrough,
             operations: options.operations,
             seconds: -started.timeIntervalSinceNow)
     }
@@ -109,15 +118,21 @@ public enum VideoForge {
         guard let first = sources.first else {
             throw VideoForgeError.incompatibleClips(reason: "no clips were given")
         }
+        var clips: [VideoInfo] = []
+        for source in sources { clips.append(try await describe(source)) }
+        let before = clips[0]
+        // Deep if ANY clip is deep: a 10-bit clip in the middle of 8-bit
+        // ones still must not be written by an 8-bit encoder.
+        let codec = try export.codec(forClips: clips)
+        let container = try CodecPlan.container(explicit: export.container, destination: destination,
+                                                inherited: before.container, codec: codec)
         try check(destination, overwrites: overwrites)
-        let before = try await describe(first)
 
         let composition = try await Composer.concatenate(
             sources.map { AVURLAsset(url: $0) }, keepsAudio: export.keepsAudio)
-        let container = export.container ?? before.container ?? .mov
         // Joining re-times the samples, so passthrough is not on offer.
         try await Composer.export(composition, to: destination, container: container,
-                                  preset: AVAssetExportPresetHighestQuality)
+                                  preset: CodecPlan.preset(for: codec))
 
         return VideoProcessResult(
             source: first, destination: destination, before: before,
@@ -136,6 +151,8 @@ public enum VideoForge {
     ///   - destination: Where to write.
     ///   - keepsAudio: Reverse the sound too. A reversed picture with
     ///     forward sound is worse than a silent one.
+    ///   - codec: The codec to write; the source's own by default, and a
+    ///     10-bit source is read and written at 10 bits.
     ///   - budget: The most memory to hold in frames at once.
     ///   - overwrites: Whether an existing file may be replaced.
     /// - Returns: What happened.
@@ -143,12 +160,13 @@ public enum VideoForge {
     @discardableResult
     public static func reverse(_ source: URL, to destination: URL,
                                keepsAudio: Bool = true,
+                               codec: VideoCodec = .source,
                                budget: Int = Frames.defaultMemoryBudget,
                                overwrites: Bool = false) async throws -> VideoProcessResult {
         let started = Date()
         let before = try await describe(source)
         let after = try await Reverser.reverse(source, to: destination, keepsAudio: keepsAudio,
-                                               budget: budget, overwrites: overwrites)
+                                               codec: codec, budget: budget, overwrites: overwrites)
         return VideoProcessResult(source: source, destination: destination, before: before,
                                   after: after, passedThrough: false, operations: [.reverse],
                                   seconds: -started.timeIntervalSinceNow)
@@ -207,8 +225,13 @@ public enum VideoForge {
                                 keepsOriginalAudio: Bool = false,
                                 overwrites: Bool = false) async throws -> VideoProcessResult {
         let started = Date()
-        try check(destination, overwrites: overwrites)
         let before = try await describe(source)
+        // The picture is re-encoded in its own codec — a 10-bit clip under
+        // new music stays 10-bit.
+        let export = ExportSpec()
+        let codec = try export.codec(for: before)
+        let container = try export.container(for: before, destination: destination)
+        try check(destination, overwrites: overwrites)
 
         let asset = AVURLAsset(url: source)
         let musicAsset = AVURLAsset(url: music)
@@ -228,9 +251,8 @@ public enum VideoForge {
                                       of: musicTrack, at: .zero)
         }
 
-        let container = before.container ?? .mov
         try await Composer.export(composition, to: destination, container: container,
-                                  preset: AVAssetExportPresetHighestQuality)
+                                  preset: CodecPlan.preset(for: codec))
 
         return VideoProcessResult(
             source: source, destination: destination, before: before,

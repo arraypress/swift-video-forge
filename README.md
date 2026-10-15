@@ -36,9 +36,79 @@ Which one a job takes is the most consequential thing about it, so
 A job that needs both gets both, with the time work first — so the render road
 only ever sees the frames that survived the trim.
 
+Both roads write with the codec `ExportSpec.codec` names (see Codecs below).
+
 A third, narrow road adds tracks: **copy** reads every sample of every track
 and writes it back unchanged beside the new ones. It exists for subtitles,
 because the composition road cannot make a subtitle a player will offer.
+
+## Codecs
+
+```swift
+// HEVC, whatever came in. A trim to the codec the clip already has still
+// passes through untouched.
+try await VideoForge.process(clip, to: out, options: VideoProcessOptions(
+    operations: [.resize(.height(1080))], export: ExportSpec(codec: .hevc)))
+
+// What a spec comes to for a clip: `.source` resolved, the depth rule
+// applied, and the container that can hold it.
+let codec = try spec.codec(for: info)                          // .hevc
+let container = try spec.container(for: info, destination: out) // .mov
+```
+
+| `VideoCodec` | written as | depth | containers |
+|---|---|---|---|
+| `.source` *(default)* | the clip's own: `avc1` → H.264, `hvc1`/`hev1` → HEVC, ProRes → ProRes; anything else → HEVC if 10-bit, H.264 if not | the source's | the source's |
+| `.h264` | H.264 High | 8-bit | mov, mp4, m4v |
+| `.hevc` | HEVC Main, or **Main 10** from a 10-bit source | 8 or 10 | mov, mp4, m4v |
+| `.hevcAlpha` | HEVC Main with alpha | **8-bit** | mov, mp4, m4v |
+| `.proRes422` | ProRes 422 (`apcn`), 4:2:2 | 10-bit | **mov only** |
+| `.proRes4444` | ProRes 4444 (`ap4h`), 4:4:4:4 | 12-bit | **mov only** |
+
+**10-bit footage is never written by an 8-bit encoder.** Asking for `.h264` or
+`.hevcAlpha` with a 10-bit source throws `wouldTruncateDepth` before anything is
+written; `.source` keeps 10-bit footage 10-bit, even when the clip's own codec is
+one this library cannot write (it becomes HEVC Main 10). A join is deep if any of
+its clips is. ProRes asked into `.mp4` throws `codecNeedsContainer`; ProRes that
+merely inherited `.mp4` from its source is written to `.mov`. Every road honours
+all of this — the export session, a join, `addAudio`, and `reverse`, which reads a
+10-bit source at 10 bits.
+
+**Up to 0.3.1 none of it happened.** `ExportSpec.codec` was read by nobody and
+every re-encode used the H.264 preset, so `.hevc` and `.proRes422` wrote H.264,
+and a 10-bit HEVC clip came out of a plain resize — no codec asked for — as 8-bit
+H.264. Measured on synthetic clips, 0.3.1 → 0.4.0, read back with ffprobe; "levels"
+counts the distinct 10-bit luma values along one row of a ramp that holds 256:
+
+| 10-bit HEVC source, then | 0.3.1 | 0.4.0 |
+|---|---|---|
+| resize, codec left alone | h264 yuv420p, 63 levels | hevc Main 10, 256 levels |
+| resize `.hevc` | h264 yuv420p, 63 levels | hevc Main 10, 256 levels |
+| resize `.proRes422` | h264 yuv420p | prores yuv422p10le, 261 levels |
+| resize `.h264` | h264 yuv420p, 63 levels | refused |
+| reverse | h264 yuv420p, 66 levels | hevc Main 10, 253 levels |
+
+Also measured, and now handled:
+
+- **The HEVC-with-alpha preset will not copy a source without alpha** (-11838 /
+  -16976) but redraws one happily, so a time-only job written as `.hevcAlpha` goes
+  through an empty render.
+- **ProRes shifted untagged footage.** Redrawn from an untagged source, ProRes
+  frames came out 27–39 codes brighter, tagged SMPTE 170M with no transfer
+  function; H.264 and HEVC tag Rec. 709 and kept every value. A redraw of untagged
+  footage is now tagged Rec. 709 — the convention for untagged video — and ProRes
+  keeps every value. A tagged source keeps its own tags.
+- **ProRes 4444 redraws are not full depth.** On the same ramp a ProRes 4444
+  *redraw* keeps 102–112 levels (a copy keeps all of them, as do ProRes 422 and
+  HEVC redraws). That is more than 8 bits could hold (64) but less than the
+  source; for a 10-bit grade, write `.proRes422` or `.hevc`.
+
+ProRes is the fast, large choice. Three seconds of 4K30 test pattern with AAC, `vid` release build on an M3 Max:
+
+| | H.264 / HEVC | ProRes 422 | ProRes 4444 |
+|---|---|---|---|
+| re-encode, time only | 1.1 s · 42 MB RSS · 7–8 MB | 0.6 s · 120 MB · 88 MB | 0.6 s · 185 MB · 175–183 MB |
+| grade (redraw) | 1.2 s · 70 MB RSS · 6–8 MB | 0.6–0.7 s · 129–144 MB · 92 MB | 0.7–0.8 s · 200 MB · 184–187 MB |
 
 ## Subtitle tracks
 

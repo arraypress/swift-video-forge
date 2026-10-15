@@ -179,22 +179,4 @@ public enum Composer {
             throw VideoForgeError.exportFailed(reason: error.localizedDescription)
         }
     }
-
-    /// The preset to ask for.
-    ///
-    /// Passthrough copies samples verbatim, which is instant and lossless —
-    /// but it cannot change the frame, so it is only offered when the job
-    /// is genuinely a rearrangement of time.
-    ///
-    /// - Parameters:
-    ///   - spec: The export settings.
-    ///   - timeOnly: Whether every operation was time-only.
-    /// - Returns: The preset name.
-    public static func preset(for spec: ExportSpec, timeOnly: Bool) -> String {
-        guard timeOnly, spec.prefersPassthrough, spec.codec == .source,
-              spec.bitRate == nil, spec.frameRate == nil else {
-            return AVAssetExportPresetHighestQuality
-        }
-        return AVAssetExportPresetPassthrough
-    }
 }

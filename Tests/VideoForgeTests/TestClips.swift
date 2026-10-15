@@ -18,6 +18,7 @@
 import AVFoundation
 import CoreGraphics
 import Foundation
+import VideoToolbox
 @testable import VideoForge
 
 enum TestClips {
@@ -139,6 +140,120 @@ enum TestClips {
         try? FileManager.default.removeItem(at: silent)
         try? FileManager.default.removeItem(at: tone)
         return url
+    }
+
+    /// A 10-bit HEVC (Main 10) clip whose every frame is a slow horizontal
+    /// luma ramp — 256 distinct 10-bit levels across the row, which 8 bits
+    /// can only hold 64 of. Counting the levels that come back out says
+    /// whether anything on the way squeezed the footage through 8 bits.
+    ///
+    /// Untagged — no colour primaries, transfer or matrix — like a lot of
+    /// footage that has been through other tools.
+    ///
+    /// - Parameters:
+    ///   - url: Where to write it.
+    ///   - seconds: How long.
+    ///   - fps: Frames per second.
+    ///   - width: Frame width. Even.
+    ///   - height: Frame height. Even.
+    static func writeDeepVideo(to url: URL, seconds: Double = 1, fps: Int = 30,
+                               width: Int = 320, height: Int = 240) async throws {
+        try? FileManager.default.removeItem(at: url)
+        let writer = try AVAssetWriter(outputURL: url, fileType: .mov)
+        let input = AVAssetWriterInput(mediaType: .video, outputSettings: [
+            AVVideoCodecKey: AVVideoCodecType.hevc,
+            AVVideoWidthKey: width, AVVideoHeightKey: height,
+            AVVideoCompressionPropertiesKey: [
+                AVVideoProfileLevelKey: kVTProfileLevel_HEVC_Main10_AutoLevel as String,
+                AVVideoQualityKey: 1.0,
+            ],
+        ])
+        input.expectsMediaDataInRealTime = false
+        let adaptor = AVAssetWriterInputPixelBufferAdaptor(
+            assetWriterInput: input,
+            sourcePixelBufferAttributes: [
+                kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange,
+                kCVPixelBufferWidthKey as String: width,
+                kCVPixelBufferHeightKey as String: height,
+            ])
+        writer.add(input)
+        writer.startWriting()
+        writer.startSession(atSourceTime: .zero)
+
+        let total = Int(Double(fps) * seconds)
+        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+            var frame = 0
+            input.requestMediaDataWhenReady(on: DispatchQueue(label: "test.write.deep")) {
+                while input.isReadyForMoreMediaData {
+                    guard frame < total else {
+                        input.markAsFinished()
+                        continuation.resume()
+                        return
+                    }
+                    guard let pool = adaptor.pixelBufferPool else { continue }
+                    var buffer: CVPixelBuffer?
+                    CVPixelBufferPoolCreatePixelBuffer(nil, pool, &buffer)
+                    guard let pixels = buffer else { continue }
+
+                    // 10-bit samples sit in the HIGH bits of each 16-bit word.
+                    CVPixelBufferLockBaseAddress(pixels, [])
+                    if let luma = CVPixelBufferGetBaseAddressOfPlane(pixels, 0) {
+                        let stride = CVPixelBufferGetBytesPerRowOfPlane(pixels, 0)
+                        for y in 0..<height {
+                            let row = (luma + y * stride).assumingMemoryBound(to: UInt16.self)
+                            for x in 0..<width {
+                                row[x] = UInt16(256 + x * 256 / width) << 6
+                            }
+                        }
+                    }
+                    if let chroma = CVPixelBufferGetBaseAddressOfPlane(pixels, 1) {
+                        let stride = CVPixelBufferGetBytesPerRowOfPlane(pixels, 1)
+                        for y in 0..<(height / 2) {
+                            let row = (chroma + y * stride).assumingMemoryBound(to: UInt16.self)
+                            for x in 0..<width { row[x] = 512 << 6 }
+                        }
+                    }
+                    CVPixelBufferUnlockBaseAddress(pixels, [])
+                    adaptor.append(pixels, withPresentationTime:
+                        CMTime(value: CMTimeValue(frame), timescale: CMTimeScale(fps)))
+                    frame += 1
+                }
+            }
+        }
+        await writer.finishWriting()
+    }
+
+    /// The 10-bit luma along the middle row of a clip's first frame, decoded
+    /// at 10 bits whatever the file holds — so an 8-bit file comes back as
+    /// 8-bit values scaled up, with three in four levels missing.
+    ///
+    /// - Parameter url: The clip.
+    /// - Returns: One luma value per pixel, 0–1023.
+    static func middleRow(of url: URL) async throws -> [Int] {
+        let asset = AVURLAsset(url: url)
+        guard let track = try await asset.loadTracks(withMediaType: .video).first else { return [] }
+        let reader = try AVAssetReader(asset: asset)
+        let output = AVAssetReaderTrackOutput(track: track, outputSettings: [
+            kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange,
+        ])
+        reader.add(output)
+        reader.startReading()
+        defer { reader.cancelReading() }
+        guard let sample = output.copyNextSampleBuffer(),
+              let pixels = CMSampleBufferGetImageBuffer(sample) else { return [] }
+        CVPixelBufferLockBaseAddress(pixels, .readOnly)
+        defer { CVPixelBufferUnlockBaseAddress(pixels, .readOnly) }
+        guard let luma = CVPixelBufferGetBaseAddressOfPlane(pixels, 0) else { return [] }
+        let width = CVPixelBufferGetWidthOfPlane(pixels, 0)
+        let height = CVPixelBufferGetHeightOfPlane(pixels, 0)
+        let stride = CVPixelBufferGetBytesPerRowOfPlane(pixels, 0)
+        let row = (luma + (height / 2) * stride).assumingMemoryBound(to: UInt16.self)
+        return (0..<width).map { Int(row[$0] >> 6) }
+    }
+
+    /// How many distinct luma levels the middle row of a clip holds.
+    static func lumaLevels(in url: URL) async throws -> Int {
+        Set(try await middleRow(of: url)).count
     }
 
     /// A directory that cleans itself up.

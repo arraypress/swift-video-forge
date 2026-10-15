@@ -23,10 +23,16 @@
 //  Audio is reversed separately, through a file rather than a second writer
 //  input, because feeding one writer two inputs is what deadlocks it.
 //
+//  Depth: frames were once read as 8-bit BGRA and written as H.264 whatever
+//  the source, so a 10-bit clip came back 8-bit. A deep source is now read
+//  as 10-bit 4:2:0 (three bytes a pixel, under the four the budget assumes)
+//  and written as HEVC Main 10 — or whichever deep codec was asked for.
+//
 
 import AVFoundation
 import CoreMedia
 import Foundation
+import VideoToolbox
 
 /// Plays a clip backwards.
 public enum Reverser {
@@ -38,6 +44,8 @@ public enum Reverser {
     ///   - destination: Where to write.
     ///   - keepsAudio: Reverse the sound as well. A reversed clip with
     ///     forward audio is worse than a silent one.
+    ///   - codec: The codec to write; ``VideoCodec/source`` keeps the
+    ///     source's, depth included.
     ///   - budget: The most memory to hold in frames at once. The clip is
     ///     divided into chunks that fit.
     ///   - overwrites: Whether an existing file may be replaced.
@@ -46,12 +54,16 @@ public enum Reverser {
     @discardableResult
     public static func reverse(_ source: URL, to destination: URL,
                                keepsAudio: Bool = true,
+                               codec: VideoCodec = .source,
                                budget: Int = Frames.defaultMemoryBudget,
                                overwrites: Bool = false) async throws -> VideoInfo {
-        try VideoForge.check(destination, overwrites: overwrites)
         let info = try await Probe.describe(source)
         guard let track = info.video else { throw VideoForgeError.noVideoTrack(source) }
         guard info.duration > 0 else { throw VideoForgeError.emptyRange("a clip of no length") }
+        let export = ExportSpec(codec: codec)
+        let writes = try export.codec(for: info)
+        let container = try export.container(for: info, destination: destination)
+        try VideoForge.check(destination, overwrites: overwrites)
 
         let asset = AVURLAsset(url: source)
         let chunks = plan(info: info, budget: budget)
@@ -64,7 +76,8 @@ public enum Reverser {
         var pieces: [URL] = []
         for (index, range) in chunks.enumerated().reversed() {
             let piece = workspace.appendingPathComponent("chunk-\(index).mov")
-            try await reverseChunk(asset, range: range, track: track, to: piece)
+            try await reverseChunk(asset, range: range, track: track, codec: writes,
+                                   deep: info.isDeep, to: piece)
             pieces.append(piece)
         }
         guard !pieces.isEmpty else { throw VideoForgeError.emptyRange("the clip") }
@@ -77,10 +90,8 @@ public enum Reverser {
             try add(reversedAudio, to: composition)
         }
 
-        let container = VideoContainer.named(fileExtension: destination.pathExtension)
-            ?? info.container ?? .mov
         try await Composer.export(composition, to: destination, container: container,
-                                  preset: AVAssetExportPresetHighestQuality)
+                                  preset: CodecPlan.preset(for: writes))
         return try await Probe.describe(destination)
     }
 
@@ -108,15 +119,25 @@ public enum Reverser {
     }
 
     /// Reads one chunk's frames and writes them backwards.
-    static func reverseChunk(_ asset: AVAsset, range: CMTimeRange,
-                             track: TrackInfo, to url: URL) async throws {
+    ///
+    /// - Parameters:
+    ///   - asset: The source.
+    ///   - range: The chunk.
+    ///   - track: The source's video track, described.
+    ///   - codec: The concrete codec to write.
+    ///   - deep: Whether the source is 10-bit, so the frames are read and
+    ///     written at 10 bits rather than squeezed through 8-bit BGRA.
+    ///   - url: Where the chunk goes.
+    static func reverseChunk(_ asset: AVAsset, range: CMTimeRange, track: TrackInfo,
+                             codec: VideoCodec, deep: Bool, to url: URL) async throws {
         guard let source = try await asset.loadTracks(withMediaType: .video).first else {
             throw VideoForgeError.noVideoTrack(url)
         }
         let reader = try AVAssetReader(asset: asset)
         reader.timeRange = range
+        let format = deep ? kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange : kCVPixelFormatType_32BGRA
         let output = AVAssetReaderTrackOutput(track: source, outputSettings: [
-            kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA,
+            kCVPixelBufferPixelFormatTypeKey as String: format,
         ])
         reader.add(output)
         guard reader.startReading() else {
@@ -135,21 +156,64 @@ public enum Reverser {
         // The frames come out backwards; the timestamps stay in forward order,
         // so the chunk plays for exactly as long as it did.
         let offsets = times.map { CMTimeSubtract($0, range.start) }
+        let colour = try await colourProperties(of: source)
         try await write(images.reversed(), at: offsets, size: track.size ?? .zero,
-                        bitRate: Int(track.bitRate), to: url)
+                        codec: codec, deep: deep, bitRate: Int(track.bitRate),
+                        colour: colour, to: url)
+    }
+
+    /// The source's colour tags, as writer settings, so an HLG or PQ clip
+    /// is not written back untagged and played as if it were Rec. 709.
+    static func colourProperties(of track: AVAssetTrack) async throws -> [String: String]? {
+        guard let description = try await track.load(.formatDescriptions).first else { return nil }
+        let tag = { (key: CFString) in
+            CMFormatDescriptionGetExtension(description, extensionKey: key) as? String
+        }
+        guard let primaries = tag(kCMFormatDescriptionExtension_ColorPrimaries),
+              let transfer = tag(kCMFormatDescriptionExtension_TransferFunction),
+              let matrix = tag(kCMFormatDescriptionExtension_YCbCrMatrix) else { return nil }
+        return [AVVideoColorPrimariesKey: primaries,
+                AVVideoTransferFunctionKey: transfer,
+                AVVideoYCbCrMatrixKey: matrix]
     }
 
     /// Writes frames to a file, one writer input, nothing to interleave.
-    static func write(_ frames: [CVPixelBuffer], at times: [CMTime],
-                      size: CGSize, bitRate: Int, to url: URL) async throws {
+    ///
+    /// - Parameters:
+    ///   - frames: The pictures, in the order to write them.
+    ///   - times: Their presentation times.
+    ///   - size: The frame size.
+    ///   - codec: The concrete codec.
+    ///   - deep: Whether the frames are 10-bit, which asks HEVC for Main 10.
+    ///   - bitRate: The source's rate, honoured by the inter-frame codecs.
+    ///   - colour: Colour tags to carry, if the source had them.
+    ///   - url: Where to write.
+    static func write(_ frames: [CVPixelBuffer], at times: [CMTime], size: CGSize,
+                      codec: VideoCodec, deep: Bool, bitRate: Int,
+                      colour: [String: String]?, to url: URL) async throws {
         let width = Int(size.width), height = Int(size.height)
         let writer = try AVAssetWriter(outputURL: url, fileType: .mov)
         var settings: [String: Any] = [
-            AVVideoCodecKey: AVVideoCodecType.h264,
+            AVVideoCodecKey: codec.codecType ?? .h264,
             AVVideoWidthKey: width, AVVideoHeightKey: height,
         ]
-        if bitRate > 0 {
-            settings[AVVideoCompressionPropertiesKey] = [AVVideoAverageBitRateKey: bitRate]
+        var compression: [String: Any] = [:]
+        if bitRate > 0, !codec.isIntraFrame { compression[AVVideoAverageBitRateKey] = bitRate }
+        // Under the compression properties, not at the top level, where it
+        // throws an Objective-C exception.
+        if deep, codec == .hevc {
+            compression[AVVideoProfileLevelKey] = kVTProfileLevel_HEVC_Main10_AutoLevel as String
+        }
+        if !compression.isEmpty { settings[AVVideoCompressionPropertiesKey] = compression }
+        // Settings the writer would reject raise an exception Swift cannot
+        // catch, so the colour tags are offered only when they apply.
+        if let colour {
+            var tagged = settings
+            tagged[AVVideoColorPropertiesKey] = colour
+            if writer.canApply(outputSettings: tagged, forMediaType: .video) { settings = tagged }
+        }
+        guard writer.canApply(outputSettings: settings, forMediaType: .video) else {
+            throw VideoForgeError.writeFailed(url, reason: "the writer will not take \(codec.rawValue) at \(width)×\(height)")
         }
         let input = AVAssetWriterInput(mediaType: .video, outputSettings: settings)
         input.expectsMediaDataInRealTime = false

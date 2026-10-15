@@ -54,6 +54,18 @@ public enum Renderer {
                 request.finish(with: rendered, context: nil)
             }
         composition.renderSize = target
+        // MEASURED: from an UNTAGGED source, the ProRes presets wrote redrawn
+        // frames 27–39 luma codes brighter (of 1023), tagged SMPTE 170M with
+        // no transfer function; H.264 and HEVC tag Rec. 709 and kept every
+        // value. Untagged video is Rec. 709 by convention, so it is said
+        // outright. A tagged source keeps its own tags, which the
+        // composition has already picked up.
+        if composition.colorPrimaries == nil, composition.colorTransferFunction == nil,
+           composition.colorYCbCrMatrix == nil {
+            composition.colorPrimaries = AVVideoColorPrimaries_ITU_R_709_2
+            composition.colorTransferFunction = AVVideoTransferFunction_ITU_R_709_2
+            composition.colorYCbCrMatrix = AVVideoYCbCrMatrix_ITU_R_709_2
+        }
         return (composition, target)
     }
 

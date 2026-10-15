@@ -38,6 +38,9 @@ public enum VideoForgeError: Error, LocalizedError, Sendable, Equatable {
     /// A 10-bit source was asked to be written by an 8-bit codec, which
     /// would throw away the depth the camera recorded.
     case wouldTruncateDepth(codec: VideoCodec)
+    /// The codec can only be written to another container — ProRes is
+    /// QuickTime only.
+    case codecNeedsContainer(codec: VideoCodec, container: VideoContainer)
     /// The container cannot hold what it was asked to hold.
     case containerCannotHold(VideoContainer, TrackKind)
     /// Joining clips that do not agree on something that matters.
@@ -73,7 +76,9 @@ public enum VideoForgeError: Error, LocalizedError, Sendable, Equatable {
             let gb = { (n: Int) in String(format: "%.1f GB", Double(n) / 1_073_741_824) }
             return "reversing this would hold \(gb(needs)) of frames at once, over the \(gb(budget)) budget — trim it first, or scale it down"
         case .wouldTruncateDepth(let codec):
-            return "this is 10-bit footage and \(codec.rawValue) is 8-bit — write hevc, or pass the depth check explicitly"
+            return "this is 10-bit footage and \(codec.rawValue) is 8-bit — write hevc, proRes422 or proRes4444, or leave the codec as the source's"
+        case .codecNeedsContainer(let codec, let container):
+            return "\(codec.rawValue) is written only to mov, not \(container.rawValue)"
         case .containerCannotHold(let container, let kind):
             return "\(container.rawValue) cannot hold a \(kind.rawValue) track"
         case .incompatibleClips(let reason):
