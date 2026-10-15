@@ -289,6 +289,19 @@ final class VideoForgeTests: XCTestCase {
         XCTAssertTrue(result.after.hasAudio)
     }
 
+    /// Up to 0.5.0 two clips without sound failed with "Operation
+    /// Stopped": the join kept an audio track of nothing but empty edits.
+    func testSilentClipsJoin() async throws {
+        let first = out("silent-1.mov"), second = out("silent-2.mov")
+        try await TestClips.writeVideo(to: first, seconds: 1)
+        try await TestClips.writeVideo(to: second, seconds: 1, hue: 0.6)
+        for (name, export) in [("session", ExportSpec()), ("writer", ExportSpec(frameRate: 24))] {
+            let result = try await VideoForge.join([first, second], to: out("silent-\(name).mov"), export: export)
+            XCTAssertEqual(result.after.duration, 2, accuracy: 0.1, name)
+            XCTAssertFalse(result.after.hasAudio, name)
+        }
+    }
+
     func testJoiningNothingIsRefused() async {
         do {
             _ = try await VideoForge.join([], to: out("nothing.mov"))

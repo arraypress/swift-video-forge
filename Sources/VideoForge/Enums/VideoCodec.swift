@@ -15,6 +15,12 @@ import AVFoundation
 import Foundation
 
 /// The video codec to write.
+///
+/// The raw values are the names a person types — `hevc-alpha`,
+/// `pro-res422` — so every message, recipe and JSON field spells a codec
+/// the way `vid --codec` takes it. Up to 0.5.0 they were the case names,
+/// and an error told a CLI user to write `proRes422`, which `--codec`
+/// accepted only by accident of its lenient matching.
 public enum VideoCodec: String, CaseIterable, Sendable, Codable, Hashable {
     /// Whatever the source used. The default, and the only one that cannot
     /// make things worse.
@@ -24,12 +30,12 @@ public enum VideoCodec: String, CaseIterable, Sendable, Codable, Hashable {
     /// HEVC. Smaller at the same quality; Main 10 from a 10-bit source.
     case hevc
     /// HEVC with an alpha channel, for footage that has one. 8-bit.
-    case hevcAlpha
+    case hevcAlpha = "hevc-alpha"
     /// Apple ProRes 422 (10-bit 4:2:2), for an editing round trip rather
     /// than delivery. QuickTime only.
-    case proRes422
+    case proRes422 = "pro-res422"
     /// Apple ProRes 4444 (12-bit, with alpha). QuickTime only.
-    case proRes4444
+    case proRes4444 = "pro-res4444"
 
     /// The AVFoundation codec this names, or nil for ``source``.
     public var codecType: AVVideoCodecType? {

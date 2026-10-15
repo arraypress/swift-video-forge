@@ -98,6 +98,54 @@ extension VideoForge {
         }
     }
 
+    // MARK: - Carrying through a job
+
+    /// Takes the subtitle tracks out of a composition and returns them as
+    /// tracks to write from samples, each sample cut and re-timed through
+    /// the composition's edits — a trim, a speed change.
+    ///
+    /// Why not leave them in: a composition export cannot cut a sample, so
+    /// a trim inside one writes an edit list that ffmpeg and
+    /// `AVAssetReader` misread by the length of the cut (SubtitleRetiming).
+    /// And a re-encoding export drops subtitle tracks altogether.
+    ///
+    /// - Parameters:
+    ///   - composition: The composition, built from `asset`. Its subtitle
+    ///     tracks are removed.
+    ///   - asset: The source the composition reads.
+    ///   - url: The source's file, for errors.
+    /// - Returns: The tracks, in the composition's order.
+    /// - Throws: ``VideoForgeError/unreadable(_:reason:)`` when a track
+    ///   cannot be read.
+    static func detachSubtitles(from composition: AVMutableComposition, of asset: AVURLAsset,
+                                url: URL) async throws -> [Remuxer.MadeTrack] {
+        var made: [Remuxer.MadeTrack] = []
+        for track in composition.tracks(withMediaType: .subtitle) {
+            let segments = track.segments ?? []
+            composition.removeTrack(track)
+            guard let sourceID = segments.first(where: { !$0.isEmpty })?.sourceTrackID,
+                  let source = try await asset.loadTrack(withTrackID: sourceID) else { continue }
+            let (formats, language, tag, enabled, timescale) = try await source.load(
+                .formatDescriptions, .languageCode, .extendedLanguageTag, .isEnabled, .naturalTimeScale)
+            guard let format = formats.first else { continue }
+            var samples = SubtitleRetiming.retime(
+                try await samples(of: source, in: asset, url: url),
+                through: segments.map { SubtitleRetiming.Segment($0) },
+                timescale: timescale > 0 ? timescale : 1000)
+            // A tx3g track is given a gap sample from zero rather than an
+            // empty edit; other formats keep what they have.
+            if CMFormatDescriptionGetMediaSubType(format) == kCMSubtitleFormatType_3GText {
+                samples = SubtitleRetiming.filledFromZero(samples, gap: try TX3G.encode(""))
+            }
+            guard !samples.isEmpty else { continue }
+            made.append(Remuxer.MadeTrack(
+                mediaType: .subtitle, format: format,
+                languageCode: language.flatMap { $0 == "und" ? nil : $0 },
+                extendedLanguageTag: tag, isDefault: enabled, samples: samples))
+        }
+        return made
+    }
+
     // MARK: - Languages
 
     /// Whether a subtitle track can declare this language — `en`, `eng`,
@@ -165,14 +213,16 @@ extension VideoForge {
                          url: URL) async throws -> [SubtitleCue]? {
         switch codec {
         case "tx3g", "text":
-            let samples = try samples(of: track, in: asset, url: url)
+            let samples = try await samples(of: track, in: asset, url: url)
             return SubtitleTimeline.cues(from: samples.compactMap { sample in
-                TX3G.decode(sample.data).map { SubtitleTimeline.Piece(start: sample.start, end: sample.end, text: $0) }
+                TX3G.decode(sample.data).map {
+                    SubtitleTimeline.Piece(start: sample.range.start.seconds, end: sample.range.end.seconds, text: $0)
+                }
             })
         case "wvtt":
-            let samples = try samples(of: track, in: asset, url: url)
+            let samples = try await samples(of: track, in: asset, url: url)
             return SubtitleTimeline.cues(fromConcurrent: samples.compactMap { sample in
-                WebVTTSample.decode(sample.data).map { (sample.start, sample.end, $0) }
+                WebVTTSample.decode(sample.data).map { (sample.range.start.seconds, sample.range.end.seconds, $0) }
             })
         case "c608":
             return try await closedCaptions(of: track, in: asset, url: url)
@@ -181,9 +231,15 @@ extension VideoForge {
         }
     }
 
-    /// The raw samples of a sparse track, with their times.
+    /// The samples of a sparse track, with the times they PLAY at.
+    ///
+    /// `AVAssetReaderTrackOutput` gives a subtitle track's samples in media
+    /// time, its edit list ignored — a track trimmed 0.25 s into a sample
+    /// read 0.25 s late — so the times are put through the track's edits
+    /// here (see SubtitleRetiming).
     static func samples(of track: AVAssetTrack, in asset: AVURLAsset,
-                        url: URL) throws -> [(start: Double, end: Double, data: Data)] {
+                        url: URL) async throws -> [Remuxer.Sample] {
+        let (segments, timescale) = try await track.load(.segments, .naturalTimeScale)
         let reader: AVAssetReader
         do { reader = try AVAssetReader(asset: asset) } catch {
             throw VideoForgeError.unreadable(url, reason: error.localizedDescription)
@@ -193,23 +249,27 @@ extension VideoForge {
         guard reader.startReading() else {
             throw VideoForgeError.unreadable(url, reason: reader.error?.localizedDescription ?? "the track could not be read")
         }
-        var samples: [(start: Double, end: Double, data: Data)] = []
+        var samples: [Remuxer.Sample] = []
         while let buffer = output.copyNextSampleBuffer() {
+            // The reader also hands back empty marker buffers — the edit's
+            // start, the track's end — which carry no text.
             guard let block = CMSampleBufferGetDataBuffer(buffer) else { continue }
+            let start = CMSampleBufferGetPresentationTimeStamp(buffer)
+            let duration = CMSampleBufferGetDuration(buffer)
+            guard start.isNumeric, duration.isNumeric else { continue }
             let length = CMBlockBufferGetDataLength(block)
             var data = Data(count: length)
             let status = data.withUnsafeMutableBytes {
                 CMBlockBufferCopyDataBytes(block, atOffset: 0, dataLength: length, destination: $0.baseAddress!)
             }
             guard status == noErr else { continue }
-            let start = CMSampleBufferGetPresentationTimeStamp(buffer)
-            let duration = CMSampleBufferGetDuration(buffer)
-            samples.append((start.seconds, (start + duration).seconds, data))
+            samples.append(Remuxer.Sample(range: CMTimeRange(start: start, duration: duration), data: data))
         }
         if reader.status == .failed {
             throw VideoForgeError.unreadable(url, reason: reader.error?.localizedDescription ?? "reading the track failed")
         }
-        return samples
+        return SubtitleRetiming.retime(samples, through: segments.map { SubtitleRetiming.Segment($0) },
+                                       timescale: timescale > 0 ? timescale : 1000)
     }
 
     /// CEA-608 closed captions, through AVFoundation's caption reader.

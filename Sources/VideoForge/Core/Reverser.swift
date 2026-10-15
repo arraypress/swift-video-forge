@@ -82,8 +82,9 @@ public enum Reverser {
         }
         guard !pieces.isEmpty else { throw VideoForgeError.emptyRange("the clip") }
 
+        // Every chunk is turned the same way, so none needs placing.
         let composition = try await Composer.concatenate(
-            pieces.map { AVURLAsset(url: $0) }, keepsAudio: false)
+            pieces.map { AVURLAsset(url: $0) }, keepsAudio: false).composition
 
         if keepsAudio, info.hasAudio,
            let reversedAudio = try? await reverseAudio(asset, into: workspace) {

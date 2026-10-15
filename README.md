@@ -117,6 +117,14 @@ and an AAC encoder that gave a different stream on each 0.7.0 run. The deliberat
 differences are the fixes below: passthrough speed with sound, HLG tags, alpha,
 ProRes 4444 redraws, reverse.
 
+Re-run for 0.6.0, against `vid` 0.8.0: 16 of the 20 identical. `rotate` and `grade`
+differ from 0.8.0 exactly as much as two 0.8.0 runs differ from each other (69.8 dB
+PSNR both; 57.2 dB between 0.8.0 runs, 57.7 dB to 0.6.0), and `speed --reencode` and
+the same-size join have identical frames and sound whose AAC differed on every
+0.8.0 run (−5 to +20 dB SNR between two 0.8.0 runs; 0.6.0's runs fall inside that).
+A subtitled clip trimmed, cropped, sped up and resampled to 24 fps keeps identical
+frames and sound too — only its subtitle track changed.
+
 ## Codecs
 
 ```swift
@@ -139,6 +147,11 @@ let container = try spec.container(for: info, destination: out) // .mov
 | `.hevcAlpha` | HEVC Main with alpha | **8-bit** | mov, mp4, m4v |
 | `.proRes422` | ProRes 422 (`apcn`), 4:2:2 | 10-bit | **mov only** |
 | `.proRes4444` | ProRes 4444 (`ap4h`), 4:4:4:4 | 12-bit | **mov only** |
+
+The raw values — what JSON, recipes and every error message say — are the names
+typed at a command line: `source`, `h264`, `hevc`, `hevc-alpha`, `pro-res422`,
+`pro-res4444`. Up to 0.5.0 they were the case names, so a message told a `vid`
+user to write `proRes422`.
 
 **10-bit footage is never written by an 8-bit encoder.** Asking for `.h264` or
 `.hevcAlpha` with a 10-bit source throws `wouldTruncateDepth` before anything is
@@ -237,7 +250,8 @@ ffmpeg wrote, rebuilt from its keys. Then the mux:
 - **The composition road loses the menu.** A passthrough export writes every
   track with alternate group 0, and a subtitle outside an alternate group is
   never offered — the legible media-selection group came back empty. The copy
-  road puts every subtitle track, old and new, in one writer input group.
+  road puts every subtitle track, old and new, in one writer input group, and
+  since 0.6.0 every other job writes its subtitles through it too (below).
 - **macOS 26's async writer receivers deadlocked** on a plain H.264 + AAC
   copy, two seconds in, every time. Callback feeding on one serial queue does
   not, and its state sits behind one `Mutex`, so the compiler checks it.
@@ -250,6 +264,33 @@ What a `tx3g` track cannot do is hold two cues at once, so overlapping cues
 are written as what a viewer sees — stacked, in the order they appeared — and
 read back as those pieces. Cues past the video's end are cut at the end. At
 most one track is the default; the rest wait in the menu.
+
+### Through a trim, a speed change and a redraw (0.6.0)
+
+Up to 0.5.0 a trim that cut inside a subtitle sample was read three different
+ways. An export cannot cut a sample, so it kept the whole sample and wrote an
+edit list starting partway into it (`elst` media time 250 for a 0.25 s trim).
+AVPlayer honours that edit; ffmpeg's `mov_text` reader ignores it, and
+`AVAssetReaderTrackOutput` hands a subtitle track back in *media* time, edit
+ignored. Where a cue starts after the trim, read three ways:
+
+| trim | ffmpeg 0.5.0 | `subtitles(in:)` 0.5.0 | AVPlayer 0.5.0 | all three, 0.6.0 |
+|---|---|---|---|---|
+| `--from 0.25` ("one", 1→2 s) | 0.000 | 1.000 | 0.750 | 0.750 |
+| `--from 1.0` ("one", 1→2 s) | 0.000 | 0.000 | 0.000 | 0.000 |
+| `--from 2.5` ("three", 3→4 s) | 0.000 | 1.000 | 0.500 | 0.500 |
+
+A trim on a sample boundary (1.0 s) had no partial edit, which is why it alone
+agreed. Now subtitle tracks never ride a composition: they are taken out of it,
+their samples cut at the edit and re-timed (a speed change scales them), and
+written back by the remuxer with a plain edit and in the subtitle group. The
+picture and sound go through the export as before and are copied untouched —
+decoded frames and audio identical to 0.5.0's on trim, crop, speed and
+`--fps`. It also fixed two things on the way: a re-encoding export (crop,
+resize, rotate, grade, music, a forced re-encode) **dropped** the subtitle
+track, and a passthrough trim left it in alternate group 0, where players hide
+it. Reading goes through the track's edits too, so a file trimmed by 0.5.0, or
+by anything else that writes such an edit, reads as it plays.
 
 ## Measured
 
@@ -306,6 +347,22 @@ transform, and a mixed-size join is drawn at the first clip's size. `reverse` no
 derives its writer settings like every other writer here, which adds the expected
 frame rate as an encoder hint: on a 10-bit clip its decoded frames moved from
 41.8 to 42.1 dB PSNR against the source.
+
+**Joining clips turned different ways** (fixed in 0.6.0). A composition track
+holds one transform, and the join took the first clip's: a phone's portrait clip
+after a landscape one lay on its side, and a portrait first clip turned every
+landscape clip after it. The rule now: **the join is shown the way its first clip
+is, at that clip's size; each clip is turned upright by its own transform and
+fitted inside, centred, black around it** — a portrait clip in a landscape join is
+pillarboxed, a landscape one in a portrait join letterboxed, nothing cropped or
+stretched. Clips that all turn alike and share a shape take the old road
+unchanged. Clips of another *shape* were stretched to the first one's before;
+they are fitted now. Tested with synthetic four-colour clips carrying identity,
+quarter-turn and half-turn transforms, read back corner by corner against what
+AVFoundation shows for each clip alone, on the export and the writer road.
+
+**Joining clips with no sound failed** (fixed in 0.6.0): the joined audio track
+held nothing but empty edits and the export stopped with "Operation Stopped".
 
 The trim numbers are the argument for the composition road: bounding a 4K clip
 takes a hundredth of a second and does not touch a pixel.

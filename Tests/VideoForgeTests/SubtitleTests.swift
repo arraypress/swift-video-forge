@@ -267,7 +267,21 @@ final class SubtitleTests: XCTestCase {
         let asset = AVURLAsset(url: url)
         let tracks = try await asset.loadTracks(withMediaType: type)
         let track = try XCTUnwrap(tracks.first)
-        return try VideoForge.samples(of: track, in: asset, url: url).reduce(into: Data()) { $0.append($1.data) }
+        let reader = try AVAssetReader(asset: asset)
+        let output = AVAssetReaderTrackOutput(track: track, outputSettings: nil)
+        reader.add(output)
+        reader.startReading()
+        var data = Data()
+        while let buffer = output.copyNextSampleBuffer() {
+            guard let block = CMSampleBufferGetDataBuffer(buffer) else { continue }
+            let length = CMBlockBufferGetDataLength(block)
+            var bytes = Data(count: length)
+            _ = bytes.withUnsafeMutableBytes {
+                CMBlockBufferCopyDataBytes(block, atOffset: 0, dataLength: length, destination: $0.baseAddress!)
+            }
+            data.append(bytes)
+        }
+        return data
     }
 
     /// A subtitle-only MP4 with a `wvtt` track: "First" 0–2 and "Second"

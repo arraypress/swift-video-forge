@@ -76,19 +76,27 @@ enum Transcoder {
         let operations: [VideoOperation]
         let shown: CGSize
         let composition: AVMutableComposition
+        var subtitles: [Remuxer.MadeTrack] = []
+        var placements: [ClipPlacement] = []
         switch timeline {
         case .clip(let source, let steps, let size):
             (first, operations, shown) = (source, steps, size)
+            let asset = AVURLAsset(url: source)
             composition = try await Composer.build(
-                from: AVURLAsset(url: source), operations: steps, keepsAudio: export.keepsAudio,
+                from: asset, operations: steps, keepsAudio: export.keepsAudio,
                 keepsSidecarTracks: export.keepsSidecarTracks)
+            // Subtitles are written from re-timed samples, not read through
+            // the composition: the reader hands them back un-cut and in
+            // media time (SubtitleRetiming).
+            subtitles = container.holdsSubtitles
+                ? try await VideoForge.detachSubtitles(from: composition, of: asset, url: source) : []
         case .join(let sources, let size):
             guard let head = sources.first else {
                 throw VideoForgeError.incompatibleClips(reason: "no clips were given")
             }
             (first, operations, shown) = (head, [], size)
-            composition = try await Composer.concatenate(sources.map { AVURLAsset(url: $0) },
-                                                         keepsAudio: export.keepsAudio)
+            (composition, placements) = try await Composer.concatenate(sources.map { AVURLAsset(url: $0) },
+                                                                       keepsAudio: export.keepsAudio)
         }
         // Time rescaled, or sound from several files: the sound is decoded
         // rather than copied.
@@ -128,7 +136,8 @@ enum Transcoder {
             }
         } else {
             feeds.append(try await redrawnVideo(composition, operations: operations, shown: shown,
-                                                source: sourceAsset, export: export, codec: codec,
+                                                placements: placements, source: sourceAsset,
+                                                export: export, codec: codec,
                                                 reader: reader, writer: writer, url: url))
         }
 
@@ -168,30 +177,28 @@ enum Transcoder {
         }
         if audioInputs.count > 1 { writer.addAlternateGroup(audioInputs, defaultInput: audioInputs[0]) }
 
-        // Subtitles and timed metadata, copied as they are — the reader
-        // re-times a scaled edit's samples, as it does the video's. A track
-        // the writer will not take is left out and shows in `lostTracks`.
-        var subtitleInputs: [AVAssetWriterInput] = []
-        do {
-            for kind in [TrackKind.subtitle, .metadata] {
-                for track in try await composition.loadTracks(withMediaType: kind.mediaType) {
-                    let (descriptions, language, enabled) = try await track.load(
-                        .formatDescriptions, .languageCode, .isEnabled)
-                    let output = AVAssetReaderTrackOutput(track: track, outputSettings: nil)
-                    let input = AVAssetWriterInput(mediaType: kind.mediaType, outputSettings: nil,
-                                                   sourceFormatHint: descriptions.first)
-                    input.expectsMediaDataInRealTime = false
-                    if let language, language != "und" { input.languageCode = language }
-                    input.marksOutputTrackAsEnabled = enabled
-                    guard reader.canAdd(output), writer.canAdd(input) else { continue }
-                    reader.add(output)
-                    writer.add(input)
-                    feeds.append(.copying(from: output, to: input))
-                    if kind == .subtitle { subtitleInputs.append(input) }
-                }
-            }
+        // Timed metadata, copied as it is — the reader re-times a scaled
+        // edit's samples, as it does the video's. A track the writer will
+        // not take is left out and shows in `lostTracks`.
+        for track in try await composition.loadTracks(withMediaType: .metadata) {
+            let (descriptions, language, enabled) = try await track.load(
+                .formatDescriptions, .languageCode, .isEnabled)
+            let output = AVAssetReaderTrackOutput(track: track, outputSettings: nil)
+            let input = AVAssetWriterInput(mediaType: .metadata, outputSettings: nil,
+                                           sourceFormatHint: descriptions.first)
+            input.expectsMediaDataInRealTime = false
+            if let language, language != "und" { input.languageCode = language }
+            input.marksOutputTrackAsEnabled = enabled
+            guard reader.canAdd(output), writer.canAdd(input) else { continue }
+            reader.add(output)
+            writer.add(input)
+            feeds.append(.copying(from: output, to: input))
         }
-        writer.addAlternateGroup(subtitleInputs, defaultInput: nil)
+        // Subtitles, from their re-timed samples, in one group as players
+        // need them.
+        let subtitleInputs = try Remuxer.add(subtitles, to: writer, feeds: &feeds, url: url)
+        writer.addAlternateGroup(subtitleInputs.map(\.input),
+                                 defaultInput: subtitleInputs.first(where: \.isDefault)?.input)
 
         return (WriterJob(reader: reader, writer: writer, feeds: feeds), composition.duration)
     }
@@ -199,7 +206,8 @@ enum Transcoder {
     /// Image compositor, in the pixel format and settings derived for the
     /// codec, at the frame rate asked for.
     private static func redrawnVideo(_ composition: AVComposition, operations: [VideoOperation],
-                                     shown: CGSize, source: AVAsset, export: ExportSpec,
+                                     shown: CGSize, placements: [ClipPlacement],
+                                     source: AVAsset, export: ExportSpec,
                                      codec: VideoCodec, reader: AVAssetReader, writer: AVAssetWriter,
                                      url: URL) async throws -> WriterFeed {
         guard let sourceTrack = try await source.loadTracks(withMediaType: .video).first else {
@@ -208,7 +216,7 @@ enum Transcoder {
         var format = try await VideoSourceFormat.load(from: sourceTrack)
 
         let (videoComposition, renderSize) = try await Renderer.build(
-            for: composition, operations: operations, source: shown)
+            for: composition, operations: operations, source: shown, placements: placements)
         if let fps = export.frameRate {
             // MEASURED: a Core Image composition times its frames by the
             // source track (`sourceTrackIDForFrameTiming`), so a frame

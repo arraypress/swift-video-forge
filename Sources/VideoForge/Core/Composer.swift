@@ -106,16 +106,23 @@ public enum Composer {
 
     /// Joins several movies end to end.
     ///
-    /// Clips need not agree on size or codec — each is copied into the same
-    /// composition and the export re-encodes if it must. They do have to
-    /// have something to copy.
+    /// Clips need not agree on size, codec or the way they are turned —
+    /// each is copied into the same composition and the export re-encodes
+    /// if it must. They do have to have something to copy.
+    ///
+    /// A track holds one transform. When the clips are all turned the same
+    /// way and are the same shape, it is theirs; otherwise it is left
+    /// upright and each clip's own comes back in `placements`, for the
+    /// renderer to turn and fit that clip by (see Placing).
     ///
     /// - Parameters:
     ///   - assets: The clips, in order.
     ///   - keepsAudio: Whether to carry sound across.
-    /// - Returns: The joined composition.
+    /// - Returns: The joined composition, and — when the clips need placing
+    ///   one by one — where each sits and how it is turned; empty when not.
     /// - Throws: ``VideoForgeError/incompatibleClips(reason:)``.
-    public static func concatenate(_ assets: [AVAsset], keepsAudio: Bool = true) async throws -> AVMutableComposition {
+    public static func concatenate(_ assets: [AVAsset], keepsAudio: Bool = true) async throws
+        -> (composition: AVMutableComposition, placements: [ClipPlacement]) {
         guard !assets.isEmpty else {
             throw VideoForgeError.incompatibleClips(reason: "no clips were given")
         }
@@ -125,7 +132,9 @@ public enum Composer {
         let audio = keepsAudio ? composition.addMutableTrack(withMediaType: .audio,
                                                             preferredTrackID: kCMPersistentTrackID_Invalid) : nil
         var cursor = CMTime.zero
-        var transformSet = false
+        var placements: [ClipPlacement] = []
+        var shownSizes: [CGSize] = []
+        var heardAny = false
 
         for asset in assets {
             let duration = try await asset.load(.duration)
@@ -134,12 +143,14 @@ public enum Composer {
                 throw VideoForgeError.incompatibleClips(reason: "one clip has no video track")
             }
             try video?.insertTimeRange(range, of: sourceVideo, at: cursor)
-            if !transformSet {
-                video?.preferredTransform = try await sourceVideo.load(.preferredTransform)
-                transformSet = true
-            }
+            let (transform, natural) = try await sourceVideo.load(.preferredTransform, .naturalSize)
+            placements.append(ClipPlacement(range: CMTimeRange(start: cursor, duration: duration),
+                                            transform: transform))
+            let shown = CGRect(origin: .zero, size: natural).applying(transform).size
+            shownSizes.append(CGSize(width: abs(shown.width), height: abs(shown.height)))
             if let audio, let sourceAudio = try await asset.loadTracks(withMediaType: .audio).first {
                 try audio.insertTimeRange(range, of: sourceAudio, at: cursor)
+                heardAny = true
             } else if let audio {
                 // A silent clip in the middle must still take up its time,
                 // or everything after it slides forward against the picture.
@@ -147,7 +158,19 @@ public enum Composer {
             }
             cursor = CMTimeAdd(cursor, duration)
         }
-        return composition
+
+        // MEASURED: clips with no sound at all left a track of nothing but
+        // empty edits, and the export failed with "Operation Stopped" —
+        // `vid join` of two silent clips was exit 5 up to 0.8.0.
+        if let audio, !heardAny { composition.removeTrack(audio) }
+
+        guard Placing.needsPlacing(transforms: placements.map(\.transform), shownSizes: shownSizes) else {
+            video?.preferredTransform = placements[0].transform
+            return (composition, [])
+        }
+        // Upright: the renderer turns each clip by its own.
+        video?.preferredTransform = .identity
+        return (composition, placements)
     }
 
     /// Exports a composition to a file.
@@ -163,7 +186,9 @@ public enum Composer {
                               container: VideoContainer, preset: String,
                               videoComposition: AVVideoComposition? = nil) async throws {
         guard let session = AVAssetExportSession(asset: composition, presetName: preset) else {
-            throw VideoForgeError.exportFailed(reason: "no exporter for preset \(preset)")
+            // The preset's own name, without AVFoundation's prefix on it.
+            let name = preset.replacingOccurrences(of: "AVAssetExportPreset", with: "")
+            throw VideoForgeError.exportFailed(reason: "this Mac has no exporter for \(name)")
         }
         session.audioTimePitchAlgorithm = .spectral
         session.videoComposition = videoComposition

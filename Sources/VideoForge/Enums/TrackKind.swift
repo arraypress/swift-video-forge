@@ -34,4 +34,17 @@ public enum TrackKind: String, CaseIterable, Sendable, Codable, Hashable {
     public static func of(_ mediaType: AVMediaType) -> TrackKind? {
         allCases.first { $0.mediaType == mediaType }
     }
+
+    /// A media type as a reader would name it: the kind's own name, or a
+    /// plain word for the types outside these four — never the four-letter
+    /// code (`sbtl`, `clcp`) AVFoundation spells it with.
+    static func describing(_ mediaType: AVMediaType) -> String {
+        if let kind = of(mediaType) { return kind.rawValue }
+        switch mediaType {
+        case .closedCaption: return "closed-caption"
+        case .text: return "text"
+        case .timecode: return "timecode"
+        default: return "other"
+        }
+    }
 }

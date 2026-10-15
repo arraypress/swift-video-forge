@@ -112,6 +112,8 @@ public enum VideoForge {
             from: asset, operations: options.operations,
             keepsAudio: options.export.keepsAudio,
             keepsSidecarTracks: options.export.keepsSidecarTracks)
+        let subtitles = container.holdsSubtitles
+            ? try await detachSubtitles(from: composition, of: asset, url: source) : []
 
         // MEASURED: the HEVC-with-alpha preset will not COPY a source that
         // has no alpha (-11838), but redraws one without complaint — so a
@@ -124,8 +126,8 @@ public enum VideoForge {
         }
 
         let preset = passesThrough ? AVAssetExportPresetPassthrough : CodecPlan.preset(for: codec)
-        try await Composer.export(composition, to: destination, container: container,
-                                  preset: preset, videoComposition: videoComposition)
+        try await export(composition, carrying: subtitles, to: destination, container: container,
+                         preset: preset, videoComposition: videoComposition)
 
         return VideoProcessResult(
             source: source, destination: destination, before: before,
@@ -166,16 +168,19 @@ public enum VideoForge {
             try await Transcoder.write(.join(sources, size: before.size), export: export, codec: codec,
                                        container: container, to: destination)
         } else {
-            let composition = try await Composer.concatenate(
+            let (composition, placements) = try await Composer.concatenate(
                 sources.map { AVURLAsset(url: $0) }, keepsAudio: export.keepsAudio)
             // MEASURED: clips of different sizes, exported with no video
             // composition, came out as one track with a sample description
             // per size — ffmpeg could not decode past the first clip. Drawn
             // through a composition, every frame is the first clip's size.
+            // Clips turned different ways are drawn too, each turned by its
+            // own transform (see Placing).
             var videoComposition: AVVideoComposition?
-            if Set(clips.map(\.size)).count > 1 {
+            if !placements.isEmpty || Set(clips.map(\.size)).count > 1 {
                 videoComposition = try await Renderer.build(for: composition, operations: [],
-                                                            source: before.size).composition
+                                                            source: before.size,
+                                                            placements: placements).composition
             }
             // Joining re-times the samples, so passthrough is not on offer.
             try await Composer.export(composition, to: destination, container: container,
@@ -276,9 +281,9 @@ public enum VideoForge {
         let before = try await describe(source)
         // The picture is re-encoded in its own codec — a 10-bit clip under
         // new music stays 10-bit.
-        let export = ExportSpec()
-        let codec = try export.codec(for: before)
-        let container = try export.container(for: before, destination: destination)
+        let spec = ExportSpec()
+        let codec = try spec.codec(for: before)
+        let container = try spec.container(for: before, destination: destination)
         try check(destination, overwrites: overwrites)
 
         let asset = AVURLAsset(url: source)
@@ -290,6 +295,8 @@ public enum VideoForge {
         let composition = try await Composer.build(
             from: asset, operations: [], keepsAudio: keepsOriginalAudio,
             keepsSidecarTracks: true)
+        let subtitles = container.holdsSubtitles
+            ? try await detachSubtitles(from: composition, of: asset, url: source) : []
 
         if let added = composition.addMutableTrack(withMediaType: .audio,
                                                    preferredTrackID: kCMPersistentTrackID_Invalid) {
@@ -299,13 +306,41 @@ public enum VideoForge {
                                       of: musicTrack, at: .zero)
         }
 
-        try await Composer.export(composition, to: destination, container: container,
-                                  preset: CodecPlan.preset(for: codec))
+        try await export(composition, carrying: subtitles, to: destination, container: container,
+                         preset: CodecPlan.preset(for: codec))
 
         return VideoProcessResult(
             source: source, destination: destination, before: before,
             after: try await describe(destination), passedThrough: false,
             operations: [], seconds: -started.timeIntervalSinceNow)
+    }
+
+    // MARK: - Writing
+
+    /// Exports a composition — and when it had subtitle tracks, taken out
+    /// by ``detachSubtitles(from:of:url:)``, copies the export into
+    /// `destination` with them written back from their re-timed samples.
+    ///
+    /// The copy is the remuxer's: every sample of the export, byte for
+    /// byte, its edits included — measured on a passthrough trim, the
+    /// decoded frames and sound are identical before and after it. It costs
+    /// one more pass over the file, and only when there are subtitles.
+    static func export(_ composition: AVMutableComposition, carrying subtitles: [Remuxer.MadeTrack],
+                       to destination: URL, container: VideoContainer, preset: String,
+                       videoComposition: AVVideoComposition? = nil) async throws {
+        guard !subtitles.isEmpty else {
+            return try await Composer.export(composition, to: destination, container: container,
+                                             preset: preset, videoComposition: videoComposition)
+        }
+        // Beside the destination, so the copy stays on one volume.
+        let staged = destination.deletingLastPathComponent()
+            .appendingPathComponent(".\(UUID().uuidString).\(container.fileExtension)")
+        defer { try? FileManager.default.removeItem(at: staged) }
+        try await Composer.export(composition, to: staged, container: container,
+                                  preset: preset, videoComposition: videoComposition)
+        let plan = try await Remuxer.plan(AVURLAsset(url: staged), droppingSubtitles: true)
+        _ = try await Remuxer.remux(staged, copying: plan.tracks, associations: plan.associations,
+                                    adding: subtitles, to: destination, fileType: container.fileType)
     }
 
     // MARK: - Guards

@@ -379,6 +379,106 @@ enum TestClips {
         Set(try await middleRow(of: url)).count
     }
 
+    /// A clip whose stored frame is four colours — red top left, green top
+    /// right, blue bottom left, white bottom right — carrying `transform`,
+    /// as a phone's portrait clip carries a quarter turn. Which colour ends
+    /// up in which corner says how the frame was turned.
+    static func writeQuadrants(to url: URL, transform: CGAffineTransform, seconds: Double = 1,
+                               width: Int = 320, height: Int = 180) async throws {
+        try? FileManager.default.removeItem(at: url)
+        let writer = try AVAssetWriter(outputURL: url, fileType: .mov)
+        let input = AVAssetWriterInput(mediaType: .video, outputSettings: [
+            AVVideoCodecKey: AVVideoCodecType.h264, AVVideoWidthKey: width, AVVideoHeightKey: height,
+        ])
+        input.expectsMediaDataInRealTime = false
+        input.transform = transform
+        let adaptor = AVAssetWriterInputPixelBufferAdaptor(
+            assetWriterInput: input,
+            sourcePixelBufferAttributes: [
+                kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA,
+                kCVPixelBufferWidthKey as String: width, kCVPixelBufferHeightKey as String: height,
+            ])
+        writer.add(input)
+        writer.startWriting()
+        writer.startSession(atSourceTime: .zero)
+        let total = Int(30 * seconds)
+        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+            var frame = 0
+            input.requestMediaDataWhenReady(on: DispatchQueue(label: "test.quadrants")) {
+                while input.isReadyForMoreMediaData {
+                    guard frame < total else {
+                        input.markAsFinished()
+                        continuation.resume()
+                        return
+                    }
+                    guard let pool = adaptor.pixelBufferPool else { continue }
+                    var buffer: CVPixelBuffer?
+                    CVPixelBufferPoolCreatePixelBuffer(nil, pool, &buffer)
+                    guard let pixels = buffer else { continue }
+                    CVPixelBufferLockBaseAddress(pixels, [])
+                    if let context = CGContext(
+                        data: CVPixelBufferGetBaseAddress(pixels), width: width, height: height,
+                        bitsPerComponent: 8, bytesPerRow: CVPixelBufferGetBytesPerRow(pixels),
+                        space: CGColorSpaceCreateDeviceRGB(),
+                        bitmapInfo: CGImageAlphaInfo.premultipliedFirst.rawValue
+                            | CGBitmapInfo.byteOrder32Little.rawValue) {
+                        // The context counts from the bottom; the buffer's
+                        // first row is the top of the stored frame.
+                        let w = CGFloat(width) / 2, h = CGFloat(height) / 2
+                        for (x, y, colour) in [(0, h, CGColor(red: 1, green: 0, blue: 0, alpha: 1)),
+                                               (w, h, CGColor(red: 0, green: 1, blue: 0, alpha: 1)),
+                                               (0, 0, CGColor(red: 0, green: 0, blue: 1, alpha: 1)),
+                                               (w, 0, CGColor(red: 1, green: 1, blue: 1, alpha: 1))] {
+                            context.setFillColor(colour)
+                            context.fill(CGRect(x: x, y: y, width: w, height: h))
+                        }
+                    }
+                    CVPixelBufferUnlockBaseAddress(pixels, [])
+                    adaptor.append(pixels, withPresentationTime: CMTime(value: CMTimeValue(frame), timescale: 30))
+                    frame += 1
+                }
+            }
+        }
+        await writer.finishWriting()
+    }
+
+    /// The frame a player shows at `seconds` — transform applied — as a
+    /// grid of colour letters, top row first: R, G, B, W, `.` for black,
+    /// `?` for anything else. A 4×4 grid of an upright 16:9 quadrant clip
+    /// reads `RRGG RRGG BBWW BBWW`.
+    static func shownGrid(of url: URL, at seconds: Double, columns: Int = 4, rows: Int = 4) async throws -> String {
+        let generator = AVAssetImageGenerator(asset: AVURLAsset(url: url))
+        generator.appliesPreferredTrackTransform = true
+        generator.requestedTimeToleranceBefore = .zero
+        generator.requestedTimeToleranceAfter = .zero
+        let image = try await generator.image(at: CMTime(seconds: seconds, preferredTimescale: 600)).image
+        var pixels = [UInt8](repeating: 0, count: image.width * image.height * 4)
+        guard let context = CGContext(data: &pixels, width: image.width, height: image.height, bitsPerComponent: 8,
+                                      bytesPerRow: image.width * 4, space: CGColorSpaceCreateDeviceRGB(),
+                                      bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) else { return "" }
+        context.draw(image, in: CGRect(x: 0, y: 0, width: image.width, height: image.height))
+        var lines: [String] = []
+        for row in 0..<rows {
+            var line = ""
+            for column in 0..<columns {
+                // The centre of each cell, read from the top.
+                let x = (2 * column + 1) * image.width / (2 * columns)
+                let y = (2 * row + 1) * image.height / (2 * rows)
+                let offset = (y * image.width + x) * 4
+                let (r, g, b) = (Int(pixels[offset]), Int(pixels[offset + 1]), Int(pixels[offset + 2]))
+                switch (r > 180, g > 180, b > 180) {
+                case (true, true, true): line += "W"
+                case (true, false, false): line += "R"
+                case (false, true, false): line += "G"
+                case (false, false, true): line += "B"
+                default: line += max(r, g, b) < 40 ? "." : "?"
+                }
+            }
+            lines.append(line)
+        }
+        return lines.joined(separator: " ")
+    }
+
     /// A directory that cleans itself up.
     static func temporaryDirectory() -> URL {
         let url = FileManager.default.temporaryDirectory

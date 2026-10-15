@@ -79,7 +79,7 @@ public enum VideoForgeError: Error, LocalizedError, Sendable, Equatable {
             let gb = { (n: Int) in String(format: "%.1f GB", Double(n) / 1_073_741_824) }
             return "reversing this would hold \(gb(needs)) of frames at once, over the \(gb(budget)) budget — trim it first, or scale it down"
         case .wouldTruncateDepth(let codec):
-            return "this is 10-bit footage and \(codec.rawValue) is 8-bit — write hevc, proRes422 or proRes4444, or leave the codec as the source's"
+            return "this is 10-bit footage and \(codec.rawValue) is 8-bit — write hevc, pro-res422 or pro-res4444, or leave the codec as the source's"
         case .codecNeedsContainer(let codec, let container):
             return "\(codec.rawValue) is written only to mov, not \(container.rawValue)"
         case .codecTakesNoRate(let codec):

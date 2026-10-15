@@ -40,7 +40,7 @@ enum Remuxer {
     struct MadeTrack: Sendable {
         let mediaType: AVMediaType
         let format: CMFormatDescription
-        let languageCode: String
+        let languageCode: String?
         let extendedLanguageTag: String?
         let isDefault: Bool
         let samples: [Sample]
@@ -158,18 +158,7 @@ enum Remuxer {
             if mediaType == .audio { audioInputs.append((input, copied.isEnabled)) }
         }
 
-        for made in adding {
-            let input = AVAssetWriterInput(mediaType: made.mediaType, outputSettings: nil, sourceFormatHint: made.format)
-            input.expectsMediaDataInRealTime = false
-            input.languageCode = made.languageCode
-            if let tag = made.extendedLanguageTag { input.extendedLanguageTag = tag }
-            guard writer.canAdd(input) else {
-                throw VideoForgeError.writeFailed(url, reason: "the writer refused a \(made.mediaType.rawValue) track")
-            }
-            writer.add(input)
-            feeds.append(madeFeed(made, into: input, url: url))
-            subtitleInputs.append((input, made.isDefault))
-        }
+        subtitleInputs += try add(adding, to: writer, feeds: &feeds, url: url)
 
         for association in associations {
             guard let from = inputsByTrack[association.from], let to = inputsByTrack[association.to],
@@ -190,6 +179,29 @@ enum Remuxer {
                                      defaultInput: audioInputs.first(where: \.isDefault)?.input ?? audioInputs[0].input)
         }
         return (WriterJob(reader: reader, writer: writer, feeds: feeds), refused)
+    }
+
+    /// Adds an input for each made track, and a feed that writes it.
+    ///
+    /// - Returns: The inputs, each with whether it is the default — for the
+    ///   caller to put in an alternate group.
+    /// - Throws: ``VideoForgeError/writeFailed(_:reason:)`` when the writer
+    ///   refuses a track.
+    static func add(_ made: [MadeTrack], to writer: AVAssetWriter, feeds: inout [WriterFeed],
+                    url: URL) throws -> [(input: AVAssetWriterInput, isDefault: Bool)] {
+        try made.map { track in
+            let input = AVAssetWriterInput(mediaType: track.mediaType, outputSettings: nil,
+                                           sourceFormatHint: track.format)
+            input.expectsMediaDataInRealTime = false
+            if let language = track.languageCode { input.languageCode = language }
+            if let tag = track.extendedLanguageTag { input.extendedLanguageTag = tag }
+            guard writer.canAdd(input) else {
+                throw VideoForgeError.writeFailed(url, reason: "the writer refused a \(TrackKind.describing(track.mediaType)) track")
+            }
+            writer.add(input)
+            feeds.append(madeFeed(track, into: input, url: url))
+            return (input, track.isDefault)
+        }
     }
 
     /// A feed that writes made samples, in order.

@@ -35,23 +35,32 @@ public enum Renderer {
     ///   - operations: The steps. Time-only steps are ignored here — they
     ///     belong to the composition road and have already been applied.
     ///   - source: The frame's size, orientation applied.
+    ///   - placements: For a join of clips turned different ways, each
+    ///     clip's stretch and transform: every frame is turned upright by
+    ///     its own clip's and fitted into `source` (see Placing). The
+    ///     track's own transform must then be the identity. Empty for
+    ///     everything else.
     /// - Returns: The composition, and the size it renders at.
     /// - Throws: ``VideoForgeError`` when an operation cannot be honoured.
     public static func build(for asset: AVAsset,
                              operations: [VideoOperation],
-                             source: CGSize) async throws -> (composition: AVMutableVideoComposition,
-                                                              size: CGSize) {
+                             source: CGSize,
+                             placements: [ClipPlacement] = []) async throws -> (composition: AVMutableVideoComposition,
+                                                                                size: CGSize) {
         let plan = try Plan(operations: operations, source: source)
         let target = plan.outputSize
 
         let composition = try await AVMutableVideoComposition.videoComposition(
             with: asset) { request in
+                let seconds = request.compositionTime.seconds
+                var image = request.sourceImage
+                if let clip = Placing.clip(at: seconds, in: placements) {
+                    image = Placing.fitted(Placing.upright(image, transform: clip.transform), into: source)
+                }
                 // The frame's own time, so the animated parts of a grade —
                 // grain, light leaks, film damage — move instead of being
                 // frozen on one pattern for the whole clip.
-                let rendered = plan.apply(to: request.sourceImage,
-                                          at: request.compositionTime.seconds)
-                request.finish(with: rendered, context: nil)
+                request.finish(with: plan.apply(to: image, at: seconds), context: nil)
             }
         composition.renderSize = target
         // MEASURED: from an UNTAGGED source, the ProRes presets wrote redrawn

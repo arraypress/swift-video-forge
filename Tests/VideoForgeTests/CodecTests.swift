@@ -271,4 +271,33 @@ final class CodecTests: XCTestCase {
         XCTAssertEqual(VideoCodec.named("H264"), .h264)
         XCTAssertNil(VideoCodec.named("vp9"))
     }
+
+    /// Up to 0.5.0 messages printed the case names — "hevcAlpha is 8-bit",
+    /// "write hevc, proRes422 or proRes4444" — where `vid --codec` spells
+    /// them `hevc-alpha` and `pro-res422`.
+    func testMessagesSpellCodecsTheWayTheyAreTyped() throws {
+        XCTAssertEqual(VideoCodec.allCases.map(\.rawValue),
+                       ["source", "h264", "hevc", "hevc-alpha", "pro-res422", "pro-res4444"])
+        for codec in VideoCodec.allCases {
+            XCTAssertEqual(VideoCodec.named(codec.rawValue), codec, "the spelling parses back")
+        }
+        let messages = VideoCodec.allCases.flatMap { codec in
+            [VideoForgeError.wouldTruncateDepth(codec: codec), .codecNeedsContainer(codec: codec, container: .mp4),
+             .codecTakesNoRate(codec: codec)].compactMap(\.errorDescription)
+        } + [VideoForgeError.containerCannotHold(.m4a, .subtitle).errorDescription ?? ""]
+        for message in messages {
+            // A lowercase letter straight before a capital is a Swift name.
+            XCTAssertNil(message.range(of: "[a-z][A-Z]", options: .regularExpression), message)
+        }
+        XCTAssertEqual(VideoForgeError.wouldTruncateDepth(codec: .hevcAlpha).errorDescription,
+                       "this is 10-bit footage and hevc-alpha is 8-bit — write hevc, pro-res422 or pro-res4444, or leave the codec as the source's")
+
+        // A recipe or a saved job says it the same way.
+        let json = try JSONEncoder().encode(ExportSpec(codec: .proRes4444))
+        XCTAssertTrue(String(decoding: json, as: UTF8.self).contains(#""codec":"pro-res4444""#))
+
+        // Media types are named, never given as AVFoundation's four letters.
+        XCTAssertEqual(TrackKind.describing(.subtitle), "subtitle")
+        XCTAssertEqual(TrackKind.describing(.closedCaption), "closed-caption")
+    }
 }
