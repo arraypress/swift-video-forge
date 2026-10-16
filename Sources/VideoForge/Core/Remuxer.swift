@@ -111,9 +111,13 @@ enum Remuxer {
     static func remux(_ source: URL, copying: [CopiedTrack], associations: [Association],
                       adding: [MadeTrack], sound: MixedSound? = nil,
                       to url: URL, fileType: AVFileType) async throws -> [AVMediaType] {
-        let (job, refused) = try await makeJob(source, copying: copying, associations: associations,
-                                               adding: adding, sound: sound, to: url, fileType: fileType)
-        try await WriterPump.run(job)
+        var refused: [AVMediaType] = []
+        try await WriterPump.retryingStall(url) {
+            let (job, refusedTypes) = try await makeJob(source, copying: copying, associations: associations,
+                                                        adding: adding, sound: sound, to: url, fileType: fileType)
+            refused = refusedTypes
+            try await WriterPump.runOnce(job)
+        }
         return refused
     }
 

@@ -576,6 +576,21 @@ AVFoundation shows for each clip alone, on the export and the writer road.
 **Joining clips with no sound failed** (fixed in 0.6.0): the joined audio track
 held nothing but empty edits and the export stopped with "Operation Stopped".
 
+**A reader that never answers** (0.7.1). On macOS 27 an `AVAssetReader` can
+block inside `copyNextSampleBuffer` for good (found by swift-caption-kit 0.8.1:
+the call waits in `FigSemaphoreWaitRelative` and never returns). Measured here, a
+read at a time with a 30 s guard: the compositions this library builds — trim,
+speed, trim + speed, join, the sped-up copy — read **0 stalls in 200** each on
+static clips, including one made the way caption-kit's was; picture-in-picture,
+moving clips, the export-session road, blur and beauty **0 in 50** each.
+Compositions with several cuts in one source, which only caption-kit builds,
+stalled **3 times in 1,200 reads**. So the pump now has a watchdog: a step blocked
+past 30 s ends the job, the stuck reader is left alone (cancelling one mid-read
+crashed AVFoundation in caption-kit's probe), a late answer from it can never
+finish a file over the retry's, and a cancel no longer waits on it. The writer
+road and the remuxer start once more after a stall; a second is an error, never
+a hang.
+
 The trim numbers are the argument for the composition road: bounding a 4K clip
 takes a hundredth of a second and does not touch a pixel.
 

@@ -65,9 +65,13 @@ enum Transcoder {
     /// - Throws: ``VideoForgeError``, or `CancellationError`.
     static func write(_ timeline: Timeline, export: ExportSpec, codec: VideoCodec,
                       container: VideoContainer, copiesVideo: Bool = false, to url: URL) async throws {
-        let (job, end) = try await makeJob(timeline, export: export, codec: codec,
-                                           container: container, copiesVideo: copiesVideo, to: url)
-        try await WriterPump.run(job, until: end)
+        // A reader stalled inside an edited composition gets one fresh start
+        // (see WriterPump's watchdog).
+        try await WriterPump.retryingStall(url) {
+            let (job, end) = try await makeJob(timeline, export: export, codec: codec,
+                                               container: container, copiesVideo: copiesVideo, to: url)
+            try await WriterPump.runOnce(job, until: end)
+        }
     }
 
     /// Builds the composition, the reader, the writer and the feeds — all
