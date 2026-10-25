@@ -504,6 +504,42 @@ the same two jobs written as ProRes keep it all. A frame of infinite extent
 (where a clip's picture ends before its sound) is passed over rather than
 masked, which up to the first build crashed AVFoundation.
 
+## Shots and sound levels (0.8.0)
+
+```swift
+let shots = try await Scenes.detect(url)
+shots.changes   // [cut at 2.5 (0.41), cut at 7.5 (0.38), dissolve at 12.38 (0.89)]
+shots.scenes    // [0..<2.5, 2.5..<7.5, 7.5..<12.38, 12.38..<17]
+
+let levels = try await SoundLevels.measure(url)       // RMS dBFS every 50 ms
+levels.silences(below: -45, atLeast: 0.5)             // where the sound itself is quiet
+```
+
+No Apple API finds shot changes — probed against the macOS 27 SDK: VideoToolbox's
+`sceneChange` is a hint the *caller* passes to HDR metadata, and MediaIntelligence
+offers highlights and faces. `Scenes` reads every frame (up to 30 a second) at
+256×144 into a colour histogram, and a Vision feature print (revision 2) every
+quarter-second:
+
+- **A cut** is a frame whose histogram jumps at least 5× the median jump of the
+  second around it, and at least 0.02 — and the change *persists*: every frame of
+  the third of a second before differs from every frame of the third after by at
+  least half the jump. A flash or a dropped frame comes back; a cut does not.
+- **A dissolve** is where the fingerprints half a second either side differ by
+  0.7 or more — the smaller of two such pairs a quarter-second apart, so one odd
+  frame cannot make one — at the strongest point, away from any cut.
+
+Every number was measured on clips whose changes are known to the frame: 12 hard
+cuts between different dishes, 3 cuts to a close-up of the same plate, 4 re-cuts
+of one aerial of the same bridge (the weakest cuts: 6.6× their surroundings, 0.027
+absolute) and 3 one-second dissolves (0.885 and up); and on a slow pan, a fast
+zoom, a 2 s lighting ramp (0.59), a 2-frame flash and a minute of real aerial
+footage, which must find nothing (the strongest camera motion: 4.3×). **22 of 22,
+nothing false, cuts on the exact frame, dissolves within 0.12 s**; every ratio
+from 4 to 6 and dissolve threshold from 0.6 to 0.8 gave the same. The thresholds
+were chosen on these clips. A dissolve between two pictures that look alike can be
+missed. About 1 ms a frame on Apple silicon (51 s of 960×540 in 1.6 s).
+
 ## Measured
 
 Everything here was measured on macOS 27 before the code was written, and two
