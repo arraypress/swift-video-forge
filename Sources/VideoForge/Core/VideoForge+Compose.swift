@@ -16,18 +16,6 @@ import AVFoundation
 import CoreGraphics
 import Foundation
 
-/// What an edit's render did.
-public struct ComposeResult: Sendable {
-    public let result: VideoProcessResult
-    /// Where each clip landed on the edit, in seconds.
-    public let clips: [ClosedRange<Double>]
-    /// The written frame.
-    public let size: CGSize
-    /// The music and effects pass, when there was one: the speech it ducked
-    /// under, the levels, the measured loudness.
-    public let soundtrack: SoundtrackResult?
-}
-
 extension VideoForge {
 
     /// Every problem with an edit, each named by its place (`clips[2].to`);
@@ -120,9 +108,6 @@ extension VideoForge {
     }
 
     // MARK: - Checking
-
-    /// Problems found checking an edit.
-    enum EditProblems: Error { case found([String]) }
 
     /// The checked job and the first clip's description.
     static func prepared(_ edit: EditTimeline) async throws -> (Composing.Job, VideoInfo) {
