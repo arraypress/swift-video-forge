@@ -383,6 +383,62 @@ Image's colour management stays on because AVFoundation hands each source over
 in its own colour space; and a main clip whose picture ends before its sound
 gets black frames for the rest, rather than failing the export.
 
+**An overlay's own transparency is kept (0.9.0).** Up to 0.8.0 the overlay was
+blended onto the main frame through the fade-and-rounding mask alone, so every
+transparent pixel of a ProRes 4444 overlay came out black. Now the mask scales
+the overlay's own alpha and the result goes over the main frame — measured on a
+ProRes 4444 overlay whose right half is clear: `#000000` before, the main
+clip's `#0100FF` after; a half-transparent red over blue blends to `#B200B4`.
+
+## A whole edit in one render (0.9.0)
+
+```swift
+var edit = EditTimeline(clips: [
+    EditClip(talk, from: 4.2, to: 7.0),
+    EditClip(wide, from: 10, to: 16, fit: .blur, fadeOut: 0.3),
+], size: CGSize(width: 1080, height: 1920))
+edit.overlays = [EditOverlay(broll, start: 3.5, end: 8, corner: .topRight, size: 0.35, roundness: 0.1)]
+edit.drawings = [EditDrawing(start: 0, end: 2.8) { time, frame in titleImage(frame) }]
+edit.voices = [EditSound(voiceOver, start: 2.8)]
+edit.music = EditMusic(bed, bed: MusicBed(level: -14, loops: true))
+edit.sounds = [SoundCue(file: whoosh, time: 2.7)]
+let done = try await VideoForge.compose(edit, to: out)
+done.clips        // [0...2.8, 2.8...8.8]
+```
+
+Clips play end to end on one picture track; each `fit`s the frame — `fill`
+(cropped around `focus`), `fit` (black around it) or `blur` (over a blurred,
+dimmed copy of itself, the usual way to put landscape footage in a vertical
+frame) — with optional dips to black. Overlays sit on tracks of their own (a
+corner, a `rect` of shares, or `fullFrame`), keeping their transparency.
+`EditDrawing` is a closure asked for a full-frame image at each frame it
+covers, so titles and captions can come from any library (`vid compose` draws
+them with CaptionKit). Voice-overs are mixed into the clips' sound.
+
+**One encode of the picture.** The compositor (`ComposeCompositor`) draws
+every frame once — clip, overlays, drawings — through the writer road. With
+music or sound effects that file keeps its sound as float PCM, and the
+soundtrack pass (`soundtrack`, below) mixes the bed under the speech — the
+clips' and the voice-over's — and the effects into it, copying the picture:
+one picture encode and one sound encode either way. The chain it replaces
+(trim, join, pip, captions, music, sounds) re-encoded the picture about three
+times.
+
+`VideoForge.problems(in:)` returns every problem with an edit, each named by
+its place (`clips[2].to: 9.00 s is past the file's end (8.00 s)`), opening the
+files but decoding nothing; `compose` refuses an edit with any, all listed.
+`composeFrames(_:at:width:)` draws stills exactly as the render will, for a
+contact sheet before rendering.
+
+MEASURED on flat-coloured clips read back frame by frame (ComposeTests): the
+clip on screen at every time, fill leaving no bars, blur filling them with the
+picture, an overlay playing from its own first frame at its time (a clip that
+turns from green to magenta at 0.5 s), a drawing on from its start to its end,
+a voice-over heard at its time and not before (−133 dB without it), the length
+the clips' sum. A 9 s 1080×1920 edit with three clips, an overlay, a title,
+captions, a voice-over, music and a sound effect: 4.3 s on this Mac (2.6 s
+without the music pass).
+
 ## Music under speech (0.7.0)
 
 ```swift

@@ -53,11 +53,14 @@ enum OverlayDrawing {
         } else {
             mask = CIImage(color: tint).cropped(to: shown)
         }
+        // The mask (fade, rounding) scales the overlay's OWN alpha, and the result goes over the main frame: a
+        // transparent overlay (ProRes 4444, HEVC with alpha) shows the main clip through. Blending straight onto
+        // the main frame used the mask alone, and every transparent pixel came out black (MEASURED, vid ≤0.12.0).
         let blend = CIFilter.blendWithAlphaMask()
         blend.inputImage = placed
-        blend.backgroundImage = main
+        blend.backgroundImage = CIImage.empty()
         blend.maskImage = mask
-        return (blend.outputImage ?? main).cropped(to: bounds)
+        return (blend.outputImage ?? placed).composited(over: main).cropped(to: bounds)
     }
 
     /// An image scaled to a size: Lanczos, which keeps a small overlay of a

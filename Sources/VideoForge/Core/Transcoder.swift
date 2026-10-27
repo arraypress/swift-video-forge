@@ -50,6 +50,8 @@ enum Transcoder {
         case join([URL], size: CGSize)
         /// One clip over another (Overlaying).
         case overlay(Overlaying.Job)
+        /// A whole edit (Composing).
+        case compose(Composing.Job)
     }
 
     /// Writes a timeline.
@@ -61,15 +63,19 @@ enum Transcoder {
     ///   - container: The container.
     ///   - copiesVideo: Copy the video samples rather than redraw them — a
     ///     time-only job whose only need of a writer is re-timed sound.
+    ///   - pcmAudio: Write the sound as float PCM, whatever the codec — for a
+    ///     file that is mixed again before it is finished, so its sound is
+    ///     encoded once, not twice.
     ///   - url: Where to write.
     /// - Throws: ``VideoForgeError``, or `CancellationError`.
     static func write(_ timeline: Timeline, export: ExportSpec, codec: VideoCodec,
-                      container: VideoContainer, copiesVideo: Bool = false, to url: URL) async throws {
+                      container: VideoContainer, copiesVideo: Bool = false, pcmAudio: Bool = false,
+                      to url: URL) async throws {
         // A reader stalled inside an edited composition gets one fresh start
         // (see WriterPump's watchdog).
         try await WriterPump.retryingStall(url) {
-            let (job, end) = try await makeJob(timeline, export: export, codec: codec,
-                                               container: container, copiesVideo: copiesVideo, to: url)
+            let (job, end) = try await makeJob(timeline, export: export, codec: codec, container: container,
+                                               copiesVideo: copiesVideo, pcmAudio: pcmAudio, to: url)
             try await WriterPump.runOnce(job, until: end)
         }
     }
@@ -77,7 +83,7 @@ enum Transcoder {
     /// Builds the composition, the reader, the writer and the feeds — all
     /// here, so the job can be handed to the pump whole.
     private static func makeJob(_ timeline: Timeline, export: ExportSpec, codec: VideoCodec,
-                                container: VideoContainer, copiesVideo: Bool,
+                                container: VideoContainer, copiesVideo: Bool, pcmAudio: Bool,
                                 to url: URL) async throws -> sending (WriterJob, CMTime) {
         let first: URL
         let operations: [VideoOperation]
@@ -113,12 +119,19 @@ enum Transcoder {
             let built = try await Overlaying.build(job, export: export, container: container)
             (composition, drawn, audioMix, sidecars) = (built.composition, built.videoComposition,
                                                         built.audioMix, built.sidecars)
+        case .compose(let job):
+            guard let head = job.edit.clips.first?.file else {
+                throw VideoForgeError.incompatibleClips(reason: "no clips were given")
+            }
+            (first, operations, shown) = (head, [], job.frame)
+            let built = try await Composing.build(job, keepsAudio: export.keepsAudio, frameRate: export.frameRate)
+            (composition, drawn, audioMix) = (built.composition, built.videoComposition, built.audioMix)
         }
         // Time rescaled, sound from several files, or two sounds mixed: the
         // sound is decoded rather than copied.
         let decodesAudio: Bool
         switch timeline {
-        case .join: decodesAudio = true
+        case .join, .compose: decodesAudio = true
         case .overlay: decodesAudio = audioMix != nil
         case .clip: decodesAudio = operations.contains { if case .speed = $0 { return true } else { return false } }
         }
@@ -177,6 +190,10 @@ enum Transcoder {
             mixed.audioMix = audioMix
             var settings = AudioRules.encoded(like: try await lead.load(.formatDescriptions).first,
                                               bitRate: sourceRates.first ?? 0, codec: codec)
+            if pcmAudio {
+                settings.merge(AudioRules.decoded) { $1 }
+                settings[AVEncoderBitRateKey] = nil
+            }
             if !writer.canApply(outputSettings: settings, forMediaType: .audio) { settings[AVEncoderBitRateKey] = nil }
             let input = AVAssetWriterInput(mediaType: .audio, outputSettings: settings)
             input.expectsMediaDataInRealTime = false
