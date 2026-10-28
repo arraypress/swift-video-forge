@@ -581,6 +581,9 @@ quarter-second:
   second around it, and at least 0.02 — and the change *persists*: every frame of
   the third of a second before differs from every frame of the third after by at
   least half the jump. A flash or a dropped frame comes back; a cut does not.
+  So a change in the first or last third of a second is never a cut (0.9.2): it
+  cannot be seen to last. Until then the second frame of a still clip was one —
+  an H.264 encode's first frame sits 0.024 from the rest, just over the floor.
 - **A dissolve** is where the fingerprints half a second either side differ by
   0.7 or more — the smaller of two such pairs a quarter-second apart, so one odd
   frame cannot make one — at the strongest point, away from any cut.

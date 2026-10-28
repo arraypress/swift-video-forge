@@ -112,7 +112,12 @@ enum SceneCuts {
         for index in 1..<count { steps[index] = distance(histograms[index], histograms[index - 1]) }
 
         var found: [(index: Int, strength: Double)] = []
-        for index in 1..<count {
+        // A change needs a full hold of frames on both sides to be seen to
+        // last. The second frame of a still clip used to be a "cut": an
+        // encoder's first frame differs a little from the rest, and with
+        // one frame before it the persistence check had nothing to refuse.
+        guard count >= 2 * hold else { return [] }
+        for index in hold...(count - hold) {
             let step = steps[index]
             guard step >= floor else { continue }
             let around = Array(steps[max(1, index - window)..<index]) + Array(steps[(index + 1)..<min(count, index + 1 + window)])

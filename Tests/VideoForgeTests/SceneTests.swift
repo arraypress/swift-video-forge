@@ -64,6 +64,17 @@ final class SceneTests: XCTestCase {
         XCTAssertEqual(cuts.first?.kind, .cut)
     }
 
+    func testAFirstFrameThatDiffersIsNotACut() {
+        // A still clip whose first encoded frame sits a little apart from
+        // the rest: measured on a real H.264 encode, 0.024 against 0.
+        var (times, histograms) = run([(3, 90)], jitter: 0)
+        histograms[0] = spike(3, noise: 0.03)
+        XCTAssertEqual(SceneCuts.cuts(times: times, histograms: histograms, rate: 30).count, 0)
+        histograms[0] = spike(3)
+        histograms[89] = spike(3, noise: 0.03)
+        XCTAssertEqual(SceneCuts.cuts(times: times, histograms: histograms, rate: 30).count, 0, "nor a last one")
+    }
+
     /// A histogram with its mass `position` bins along, split between two
     /// neighbouring bins — a picture that keeps moving, like a pan.
     private func drifting(_ position: Double) -> [Float] {
